@@ -59,7 +59,11 @@ struct App {
     start_time: Instant,
     instances: SharedInstances,
     windowed: bool,
+    /// Readable font (Optima on macOS, fallbacks on other platforms)
     font_data: Option<FontData>,
+    /// Monospace font (Monaco on macOS, fallbacks on other platforms)
+    #[allow(dead_code)]
+    mono_font_data: Option<FontData>,
 }
 
 impl ApplicationHandler for App {
@@ -250,11 +254,20 @@ fn main() -> Result<()> {
     let instances = ws_client::spawn_clients(&runtime, endpoints);
 
     // Load fonts at startup
-    // Optima for readable text (splash quote), Monaco for monospace (future use)
+    // Optima for readable text (all UI text), Monaco for monospace (code display)
     let font_data = dashboard::load_readable_font();
-    if font_data.is_none() {
+    let mono_font_data = dashboard::load_mono_font();
+
+    if font_data.is_some() {
+        println!("Loaded readable font (Optima/Helvetica/DejaVu Sans)");
+    } else {
         eprintln!("Note: No system font found (Optima/Helvetica/DejaVu Sans).");
-        eprintln!("Splash quote will use bitmap font fallback.");
+        eprintln!("All text will use bitmap font fallback.");
+    }
+    if mono_font_data.is_some() {
+        println!("Loaded monospace font (Monaco/Menlo/DejaVu Sans Mono)");
+    } else {
+        eprintln!("Note: No monospace font found (Monaco/Menlo/DejaVu Sans Mono).");
     }
 
     let mut app = App {
@@ -266,6 +279,7 @@ fn main() -> Result<()> {
         instances,
         windowed: args.windowed,
         font_data,
+        mono_font_data,
     };
 
     let event_loop = EventLoop::new()?;
