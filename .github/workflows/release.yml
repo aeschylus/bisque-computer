@@ -1,4 +1,4 @@
-name: Release macOS Binaries
+name: Release macOS App
 
 on:
   push:
@@ -28,17 +28,46 @@ jobs:
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Package binary
+      - name: Get version
+        id: version
+        run: echo "version=${GITHUB_REF_NAME:-dev}" >> "$GITHUB_OUTPUT"
+
+      - name: Create .app bundle
+        env:
+          APP_VERSION: ${{ steps.version.outputs.version }}
         run: |
-          cd target/${{ matrix.target }}/release
-          tar czf bisque-computer-${{ matrix.arch }}-apple-darwin.tar.gz bisque-computer
-          mv bisque-computer-${{ matrix.arch }}-apple-darwin.tar.gz ../../../
+          APP="BisqueComputer.app"
+          mkdir -p "${APP}/Contents/MacOS"
+          mkdir -p "${APP}/Contents/Resources"
+
+          # Copy the binary into the bundle
+          cp "target/${{ matrix.target }}/release/bisque-computer" \
+             "${APP}/Contents/MacOS/bisque-computer"
+
+          # Create Info.plist
+          /usr/libexec/PlistBuddy -c "Clear dict" "${APP}/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Add :CFBundleName string 'Bisque Computer'" "${APP}/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string 'Bisque Computer'" "${APP}/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Add :CFBundleExecutable string 'bisque-computer'" "${APP}/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Add :CFBundleIdentifier string 'com.fullyparsed.bisque-computer'" "${APP}/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string '${APP_VERSION}'" "${APP}/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string '${APP_VERSION}'" "${APP}/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Add :CFBundlePackageType string 'APPL'" "${APP}/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Add :CFBundleInfoDictionaryVersion string '6.0'" "${APP}/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Add :NSHighResolutionCapable bool true" "${APP}/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Add :NSSupportsAutomaticGraphicsSwitching bool true" "${APP}/Contents/Info.plist"
+
+          # Create PkgInfo
+          echo -n "APPL????" > "${APP}/Contents/PkgInfo"
+
+          # Package the .app bundle as a tarball
+          tar czf "BisqueComputer-${{ matrix.arch }}-apple-darwin.tar.gz" "${APP}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: bisque-computer-${{ matrix.arch }}-apple-darwin
-          path: bisque-computer-${{ matrix.arch }}-apple-darwin.tar.gz
+          name: BisqueComputer-${{ matrix.arch }}-apple-darwin
+          path: BisqueComputer-${{ matrix.arch }}-apple-darwin.tar.gz
 
   release:
     needs: build
@@ -56,6 +85,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            bisque-computer-aarch64-apple-darwin.tar.gz
-            bisque-computer-x86_64-apple-darwin.tar.gz
+            BisqueComputer-aarch64-apple-darwin.tar.gz
+            BisqueComputer-x86_64-apple-darwin.tar.gz
           generate_release_notes: true
