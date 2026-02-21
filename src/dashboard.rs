@@ -7,7 +7,7 @@
 //! Fonts: Optima for readable text, Monaco for monospace (font stacks with fallbacks).
 //! On app open: Ulysses splash quote fades in and out.
 
-use vello::kurbo::{Affine, Point, Rect, RoundedRect};
+use vello::kurbo::{Affine, BezPath, Point, Rect, RoundedRect};
 use vello::peniko::{Color, Fill, FontData};
 use vello::{Glyph, Scene};
 
@@ -30,6 +30,26 @@ const ACCENT_AMBER: Color = Color::new([0.85, 0.60, 0.10, 1.0]);     // warning 
 const ACCENT_BLUE: Color = Color::new([0.22, 0.46, 0.72, 1.0]);      // info blue
 const BAR_BG: Color = Color::new([0.96, 0.87, 0.75, 1.0]);           // bisque bar background
 const SECTION_BG: Color = Color::new([1.0, 0.91, 0.80, 1.0]);        // bisque section fill
+
+// --- 3D Isometric Colors (bisque-compatible) ---
+const ISO_SESSION_TOP: Color = Color::new([0.82, 0.55, 0.28, 1.0]);    // warm brown top face
+const ISO_SESSION_LEFT: Color = Color::new([0.72, 0.48, 0.22, 1.0]);   // darker left face
+const ISO_SESSION_RIGHT: Color = Color::new([0.90, 0.65, 0.38, 1.0]);  // lighter right face
+const ISO_TASK_PENDING_TOP: Color = Color::new([0.85, 0.60, 0.10, 1.0]);   // amber
+const ISO_TASK_PENDING_LEFT: Color = Color::new([0.72, 0.50, 0.08, 1.0]);
+const ISO_TASK_PENDING_RIGHT: Color = Color::new([0.92, 0.70, 0.18, 1.0]);
+const ISO_TASK_ACTIVE_TOP: Color = Color::new([0.22, 0.58, 0.72, 1.0]);    // blue-ish
+const ISO_TASK_ACTIVE_LEFT: Color = Color::new([0.16, 0.46, 0.60, 1.0]);
+const ISO_TASK_ACTIVE_RIGHT: Color = Color::new([0.30, 0.66, 0.80, 1.0]);
+const ISO_TASK_DONE_TOP: Color = Color::new([0.25, 0.62, 0.35, 1.0]);      // green
+const ISO_TASK_DONE_LEFT: Color = Color::new([0.18, 0.50, 0.26, 1.0]);
+const ISO_TASK_DONE_RIGHT: Color = Color::new([0.32, 0.70, 0.42, 1.0]);
+const ISO_SHADOW: Color = Color::new([0.0, 0.0, 0.0, 0.10]);              // soft shadow
+const ISO_GROUND: Color = Color::new([0.92, 0.82, 0.68, 1.0]);            // ground plane
+const ISO_GRID: Color = Color::new([0.85, 0.73, 0.58, 0.5]);              // ground grid lines
+const ISO_INBOX_TOP: Color = Color::new([0.80, 0.20, 0.18, 1.0]);         // red for inbox
+const ISO_INBOX_LEFT: Color = Color::new([0.65, 0.15, 0.13, 1.0]);
+const ISO_INBOX_RIGHT: Color = Color::new([0.88, 0.28, 0.25, 1.0]);
 
 // --- Layout constants (doubled text sizes) ---
 
@@ -103,25 +123,63 @@ pub fn render_dashboard(
     let status_text = format!("{}/{} connected", connected, instances.len());
     draw_text(scene, width - 400.0, 50.0, &status_text, TEXT_LIGHT, 28.0);
 
-    // Layout: panels in a grid
+    // Layout: panels in a grid with 3D visualization
     let content_top = HEADER_HEIGHT + MARGIN;
     let content_width = width - 2.0 * MARGIN;
     let content_height = height - content_top - MARGIN;
 
     let num_instances = instances.len();
-    let cols = if num_instances <= 1 { 1 } else if num_instances <= 4 { 2 } else { 3 };
-    let rows = (num_instances + cols - 1) / cols;
 
-    let panel_width = (content_width - (cols as f64 - 1.0) * PANEL_GAP) / cols as f64;
-    let panel_height = (content_height - (rows as f64 - 1.0) * PANEL_GAP) / rows as f64;
+    // Check if any instance is connected (for 3D viz)
+    let any_connected = instances.iter().any(|i| i.status == ConnectionStatus::Connected);
 
-    for (idx, instance) in instances.iter().enumerate() {
-        let col = idx % cols;
-        let row = idx / cols;
-        let x = MARGIN + col as f64 * (panel_width + PANEL_GAP);
-        let y = content_top + row as f64 * (panel_height + PANEL_GAP);
+    if num_instances == 1 && any_connected {
+        // Single instance: side-by-side layout — info panel left, 3D viz right
+        let split = 0.45; // info panel gets 45% width, 3D viz gets 55%
+        let info_w = content_width * split - PANEL_GAP * 0.5;
+        let viz_w = content_width * (1.0 - split) - PANEL_GAP * 0.5;
 
-        draw_instance_panel(scene, x, y, panel_width, panel_height, instance);
+        draw_instance_panel(scene, MARGIN, content_top, info_w, content_height, &instances[0]);
+        draw_3d_visualization(
+            scene,
+            MARGIN + info_w + PANEL_GAP, content_top,
+            viz_w, content_height,
+            &instances[0], elapsed,
+        );
+    } else {
+        // Multiple instances: grid of info panels + 3D viz row at bottom
+        let viz_height = if any_connected { content_height * 0.35 } else { 0.0 };
+        let panels_height = content_height - viz_height - if any_connected { PANEL_GAP } else { 0.0 };
+
+        let cols = if num_instances <= 1 { 1 } else if num_instances <= 4 { 2 } else { 3 };
+        let rows = (num_instances + cols - 1) / cols;
+
+        let panel_width = (content_width - (cols as f64 - 1.0) * PANEL_GAP) / cols as f64;
+        let panel_height = (panels_height - (rows as f64 - 1.0) * PANEL_GAP) / rows as f64;
+
+        for (idx, instance) in instances.iter().enumerate() {
+            let col = idx % cols;
+            let row = idx / cols;
+            let x = MARGIN + col as f64 * (panel_width + PANEL_GAP);
+            let y = content_top + row as f64 * (panel_height + PANEL_GAP);
+
+            draw_instance_panel(scene, x, y, panel_width, panel_height, instance);
+        }
+
+        // Draw 3D viz panels for connected instances along the bottom
+        if any_connected {
+            let viz_top = content_top + panels_height + PANEL_GAP;
+            let connected_instances: Vec<_> = instances.iter()
+                .filter(|i| i.status == ConnectionStatus::Connected)
+                .collect();
+            let viz_cols = connected_instances.len();
+            let viz_panel_w = (content_width - (viz_cols as f64 - 1.0).max(0.0) * PANEL_GAP) / viz_cols as f64;
+
+            for (idx, instance) in connected_instances.iter().enumerate() {
+                let vx = MARGIN + idx as f64 * (viz_panel_w + PANEL_GAP);
+                draw_3d_visualization(scene, vx, viz_top, viz_panel_w, viz_height, instance, elapsed);
+            }
+        }
     }
 }
 
@@ -729,6 +787,361 @@ pub fn load_mono_font() -> Option<FontData> {
         "LiberationMono-Regular",
     ])
 }
+
+// --- 3D Isometric Visualization ---
+
+/// Isometric projection constants.
+/// We use a standard isometric angle: x-axis goes right-and-down at 30deg,
+/// z-axis goes right-and-up at 30deg, y-axis goes straight up.
+const ISO_ANGLE: f64 = std::f64::consts::PI / 6.0; // 30 degrees
+
+/// Convert a 3D (x, y, z) point to 2D screen coordinates using isometric projection.
+/// x: left-right on ground, z: front-back on ground, y: height (up).
+/// Returns (screen_x, screen_y) relative to an origin point.
+fn iso_to_screen(x: f64, y: f64, z: f64) -> (f64, f64) {
+    let cos_a = ISO_ANGLE.cos(); // ~0.866
+    let sin_a = ISO_ANGLE.sin(); // ~0.5
+    let sx = (x - z) * cos_a;
+    let sy = (x + z) * sin_a - y;
+    (sx, sy)
+}
+
+/// Draw the full 3D visualization panel within the given bounds.
+/// Shows sessions as isometric pillars and tasks as stacked cubes.
+fn draw_3d_visualization(
+    scene: &mut Scene,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    instance: &crate::protocol::LobsterInstance,
+    elapsed: f64,
+) {
+    let state = &instance.state;
+
+    // Panel background
+    let panel_rect = RoundedRect::new(x, y, x + w, y + h, CORNER_RADIUS);
+    scene.fill(Fill::NonZero, Affine::IDENTITY, PANEL_BG, None, &panel_rect);
+    scene.stroke(
+        &vello::kurbo::Stroke::new(1.5),
+        Affine::IDENTITY,
+        PANEL_BORDER,
+        None,
+        &panel_rect,
+    );
+
+    // Section header
+    let header_y = draw_section_header(scene, x + PANEL_PADDING, y + PANEL_PADDING, w - 2.0 * PANEL_PADDING, "3D OVERVIEW");
+
+    let viz_x = x + PANEL_PADDING;
+    let viz_y = header_y + 8.0;
+    let viz_w = w - 2.0 * PANEL_PADDING;
+    let viz_h = h - (viz_y - y) - PANEL_PADDING;
+
+    // Draw the ground plane (isometric diamond)
+    draw_iso_ground(scene, viz_x, viz_y, viz_w, viz_h);
+
+    // Origin point for the isometric scene (center-bottom of the viz area)
+    let origin_x = viz_x + viz_w * 0.5;
+    let origin_y = viz_y + viz_h * 0.80;
+
+    let scale = (viz_w.min(viz_h) / 400.0).max(0.4).min(1.5);
+
+    // --- Sessions pillars (left side of the isometric view) ---
+    let claude_sessions: Vec<_> = state.sessions.iter()
+        .filter(|s| s.name == "claude")
+        .collect();
+    let session_count = claude_sessions.len();
+
+    // Draw session pillars
+    for (i, session) in claude_sessions.iter().enumerate() {
+        let grid_x = -80.0 * scale + (i as f64) * 50.0 * scale;
+        let grid_z = -40.0 * scale;
+
+        // Height based on memory usage, with a subtle breathing animation
+        let base_height = (session.memory_mb / 10.0).clamp(20.0, 120.0) * scale;
+        let breath = (elapsed * 1.5 + i as f64 * 0.7).sin() * 3.0 * scale;
+        let pillar_h = base_height + breath;
+        let pillar_w = 30.0 * scale;
+
+        // Shadow on ground
+        draw_iso_shadow(scene, origin_x, origin_y, grid_x, grid_z, pillar_w, scale);
+
+        // Draw the isometric pillar (box)
+        draw_iso_box(
+            scene, origin_x, origin_y,
+            grid_x, 0.0, grid_z,
+            pillar_w, pillar_h, pillar_w * 0.8,
+            ISO_SESSION_TOP, ISO_SESSION_LEFT, ISO_SESSION_RIGHT,
+        );
+
+        // Label below the pillar
+        let (lx, ly) = iso_to_screen(grid_x, -12.0 * scale, grid_z);
+        draw_text(scene, origin_x + lx - 10.0 * scale, origin_y + ly, &format!("S{}", i + 1), TEXT_PRIMARY, 16.0 * scale);
+    }
+
+    // Session count label
+    let label_x = viz_x + 8.0;
+    let label_y = viz_y + viz_h - 10.0;
+    draw_text(scene, label_x, label_y, &format!("{} session{}", session_count, if session_count != 1 { "s" } else { "" }), TEXT_PRIMARY, 18.0);
+
+    // --- Task cubes (right side of the isometric view) ---
+    let tasks = &state.tasks.summary;
+    let inbox_count = state.message_queues.inbox.count;
+
+    // Stack cubes in a pyramid-ish arrangement
+    let cube_size = 22.0 * scale;
+    let task_base_x = 30.0 * scale;
+    let task_base_z = -30.0 * scale;
+
+    // Draw inbox items as red cubes (incoming tasks)
+    let inbox_to_show = inbox_count.min(5) as usize;
+    for i in 0..inbox_to_show {
+        let ix = task_base_x + (i as f64) * (cube_size * 1.2);
+        let iz = task_base_z - 40.0 * scale;
+        let bounce = ((elapsed * 2.5 + i as f64 * 0.4).sin().abs()) * 8.0 * scale;
+
+        draw_iso_shadow(scene, origin_x, origin_y, ix, iz, cube_size * 0.6, scale);
+        draw_iso_box(
+            scene, origin_x, origin_y,
+            ix, bounce, iz,
+            cube_size, cube_size, cube_size,
+            ISO_INBOX_TOP, ISO_INBOX_LEFT, ISO_INBOX_RIGHT,
+        );
+    }
+    if inbox_count > 5 {
+        let (lx, ly) = iso_to_screen(task_base_x + 5.0 * cube_size * 1.2, 0.0, task_base_z - 40.0 * scale);
+        draw_text(scene, origin_x + lx, origin_y + ly, &format!("+{}", inbox_count - 5), TEXT_PRIMARY, 14.0 * scale);
+    }
+
+    // Stack completed tasks as green cubes (solid base)
+    let completed = tasks.completed.min(10) as usize;
+    draw_task_stack(
+        scene, origin_x, origin_y,
+        task_base_x, task_base_z,
+        cube_size, completed,
+        ISO_TASK_DONE_TOP, ISO_TASK_DONE_LEFT, ISO_TASK_DONE_RIGHT,
+        elapsed, 0.0, scale,
+    );
+
+    // Stack in-progress tasks on top of completed (blue cubes)
+    let in_progress = tasks.in_progress.min(5) as usize;
+    let completed_height = completed as f64 * cube_size * 0.65;
+    draw_task_stack(
+        scene, origin_x, origin_y,
+        task_base_x + cube_size * 0.3, task_base_z + cube_size * 0.3,
+        cube_size * 0.9, in_progress,
+        ISO_TASK_ACTIVE_TOP, ISO_TASK_ACTIVE_LEFT, ISO_TASK_ACTIVE_RIGHT,
+        elapsed, completed_height, scale,
+    );
+
+    // Stack pending tasks as amber cubes (offset slightly)
+    let pending = tasks.pending.min(8) as usize;
+    draw_task_stack(
+        scene, origin_x, origin_y,
+        task_base_x + cube_size * 1.8, task_base_z,
+        cube_size * 0.85, pending,
+        ISO_TASK_PENDING_TOP, ISO_TASK_PENDING_LEFT, ISO_TASK_PENDING_RIGHT,
+        elapsed, 0.0, scale,
+    );
+
+    // Task legend at bottom-right
+    let legend_x = viz_x + viz_w - 180.0;
+    let legend_y = viz_y + viz_h - 50.0;
+    draw_legend_dot(scene, legend_x, legend_y, ISO_TASK_DONE_TOP);
+    draw_text(scene, legend_x + 14.0, legend_y + 4.0, &format!("{} done", tasks.completed), TEXT_PRIMARY, 14.0);
+    draw_legend_dot(scene, legend_x, legend_y + 16.0, ISO_TASK_ACTIVE_TOP);
+    draw_text(scene, legend_x + 14.0, legend_y + 20.0, &format!("{} active", tasks.in_progress), TEXT_PRIMARY, 14.0);
+    draw_legend_dot(scene, legend_x, legend_y + 32.0, ISO_TASK_PENDING_TOP);
+    draw_text(scene, legend_x + 14.0, legend_y + 36.0, &format!("{} pending", tasks.pending), TEXT_PRIMARY, 14.0);
+    if inbox_count > 0 {
+        draw_legend_dot(scene, legend_x, legend_y + 48.0, ISO_INBOX_TOP);
+        draw_text(scene, legend_x + 14.0, legend_y + 52.0, &format!("{} inbox", inbox_count), TEXT_PRIMARY, 14.0);
+    }
+}
+
+/// Draw a small colored square as a legend indicator.
+fn draw_legend_dot(scene: &mut Scene, x: f64, y: f64, color: Color) {
+    let rect = Rect::new(x, y - 4.0, x + 10.0, y + 6.0);
+    scene.fill(Fill::NonZero, Affine::IDENTITY, color, None, &rect);
+}
+
+/// Draw the isometric ground plane as a diamond shape with grid.
+fn draw_iso_ground(scene: &mut Scene, x: f64, y: f64, w: f64, h: f64) {
+    let cx = x + w * 0.5;
+    let cy = y + h * 0.80;
+    let hw = w * 0.45;
+    let hh = hw * 0.5; // isometric ratio
+
+    // Ground diamond
+    let mut path = BezPath::new();
+    path.move_to(Point::new(cx, cy - hh));       // top
+    path.line_to(Point::new(cx + hw, cy));         // right
+    path.line_to(Point::new(cx, cy + hh));         // bottom
+    path.line_to(Point::new(cx - hw, cy));         // left
+    path.close_path();
+    scene.fill(Fill::NonZero, Affine::IDENTITY, ISO_GROUND, None, &path);
+
+    // Isometric grid: lines along both axes of the diamond
+    let steps = 5;
+    for i in 1..steps {
+        let t = i as f64 / steps as f64;
+
+        // Lines parallel to top-right edge (from left edge to bottom edge)
+        let mut line1 = BezPath::new();
+        let p1 = Point::new(cx - hw * (1.0 - t), cy - hh * t);
+        let p2 = Point::new(cx + hw * t, cy + hh * (1.0 - t));
+        line1.move_to(p1);
+        line1.line_to(p2);
+        scene.stroke(
+            &vello::kurbo::Stroke::new(0.5),
+            Affine::IDENTITY, ISO_GRID, None, &line1,
+        );
+
+        // Lines parallel to top-left edge (from right edge to bottom edge)
+        let mut line2 = BezPath::new();
+        let p3 = Point::new(cx + hw * (1.0 - t), cy - hh * t);
+        let p4 = Point::new(cx - hw * t, cy + hh * (1.0 - t));
+        line2.move_to(p3);
+        line2.line_to(p4);
+        scene.stroke(
+            &vello::kurbo::Stroke::new(0.5),
+            Affine::IDENTITY, ISO_GRID, None, &line2,
+        );
+    }
+}
+
+/// Draw a soft shadow on the ground plane beneath an isometric object.
+fn draw_iso_shadow(
+    scene: &mut Scene,
+    origin_x: f64,
+    origin_y: f64,
+    grid_x: f64,
+    grid_z: f64,
+    size: f64,
+    _scale: f64,
+) {
+    let (sx, sy) = iso_to_screen(grid_x, 0.0, grid_z);
+    let shadow_w = size * 1.2;
+    let shadow_h = size * 0.4;
+    let cx = origin_x + sx;
+    let cy = origin_y + sy;
+
+    let ellipse = vello::kurbo::Ellipse::new(Point::new(cx, cy + 2.0), (shadow_w, shadow_h), 0.0);
+    scene.fill(Fill::NonZero, Affine::IDENTITY, ISO_SHADOW, None, &ellipse);
+}
+
+/// Draw a 3D isometric box (rectangular prism) at the given grid position.
+/// (grid_x, base_y, grid_z) is the base position in 3D space.
+/// (w, h, d) are width, height, depth of the box.
+fn draw_iso_box(
+    scene: &mut Scene,
+    origin_x: f64,
+    origin_y: f64,
+    grid_x: f64,
+    base_y: f64,
+    grid_z: f64,
+    w: f64,
+    h: f64,
+    d: f64,
+    top_color: Color,
+    left_color: Color,
+    right_color: Color,
+) {
+    // 8 corners of the box in 3D, projected to 2D
+    // Bottom face corners
+    let b_fl = iso_to_screen(grid_x, base_y, grid_z);         // front-left
+    let b_fr = iso_to_screen(grid_x + w, base_y, grid_z);     // front-right
+    let _b_br = iso_to_screen(grid_x + w, base_y, grid_z + d); // back-right
+    let b_bl = iso_to_screen(grid_x, base_y, grid_z + d);      // back-left
+
+    // Top face corners
+    let t_fl = iso_to_screen(grid_x, base_y + h, grid_z);
+    let t_fr = iso_to_screen(grid_x + w, base_y + h, grid_z);
+    let t_br = iso_to_screen(grid_x + w, base_y + h, grid_z + d);
+    let t_bl = iso_to_screen(grid_x, base_y + h, grid_z + d);
+
+    // Convert to screen coordinates
+    let to_pt = |p: (f64, f64)| Point::new(origin_x + p.0, origin_y + p.1);
+
+    // Draw faces back-to-front for correct occlusion:
+    // 1. Left face (back-left side)
+    let mut left_face = BezPath::new();
+    left_face.move_to(to_pt(b_fl));
+    left_face.line_to(to_pt(b_bl));
+    left_face.line_to(to_pt(t_bl));
+    left_face.line_to(to_pt(t_fl));
+    left_face.close_path();
+    scene.fill(Fill::NonZero, Affine::IDENTITY, left_color, None, &left_face);
+
+    // 2. Right face (front-right side)
+    let mut right_face = BezPath::new();
+    right_face.move_to(to_pt(b_fl));
+    right_face.line_to(to_pt(b_fr));
+    right_face.line_to(to_pt(t_fr));
+    right_face.line_to(to_pt(t_fl));
+    right_face.close_path();
+    scene.fill(Fill::NonZero, Affine::IDENTITY, right_color, None, &right_face);
+
+    // 3. Top face
+    let mut top_face = BezPath::new();
+    top_face.move_to(to_pt(t_fl));
+    top_face.line_to(to_pt(t_fr));
+    top_face.line_to(to_pt(t_br));
+    top_face.line_to(to_pt(t_bl));
+    top_face.close_path();
+    scene.fill(Fill::NonZero, Affine::IDENTITY, top_color, None, &top_face);
+
+    // Edge outlines for definition
+    let edge_color = Color::new([0.0_f32, 0.0, 0.0, 0.15]);
+    let stroke = vello::kurbo::Stroke::new(0.8);
+
+    // Left face edges
+    scene.stroke(&stroke, Affine::IDENTITY, edge_color, None, &left_face);
+    // Right face edges
+    scene.stroke(&stroke, Affine::IDENTITY, edge_color, None, &right_face);
+    // Top face edges
+    scene.stroke(&stroke, Affine::IDENTITY, edge_color, None, &top_face);
+}
+
+/// Draw a stack of cubes for tasks.
+fn draw_task_stack(
+    scene: &mut Scene,
+    origin_x: f64,
+    origin_y: f64,
+    base_x: f64,
+    base_z: f64,
+    cube_size: f64,
+    count: usize,
+    top_color: Color,
+    left_color: Color,
+    right_color: Color,
+    elapsed: f64,
+    base_height: f64,
+    _scale: f64,
+) {
+    let stack_gap = cube_size * 0.65; // slight overlap for tight stacking
+
+    for i in 0..count {
+        let y_pos = base_height + i as f64 * stack_gap;
+        // Subtle wobble animation
+        let wobble_x = (elapsed * 0.8 + i as f64 * 1.1).sin() * 1.5;
+        let wobble_z = (elapsed * 0.6 + i as f64 * 0.9).cos() * 1.0;
+
+        // Shadow only for bottom cube
+        if i == 0 && base_height < 0.1 {
+            draw_iso_shadow(scene, origin_x, origin_y, base_x + wobble_x, base_z + wobble_z, cube_size * 0.5, 1.0);
+        }
+
+        draw_iso_box(
+            scene, origin_x, origin_y,
+            base_x + wobble_x, y_pos, base_z + wobble_z,
+            cube_size, cube_size, cube_size * 0.8,
+            top_color, left_color, right_color,
+        );
+    }
+}
+
 
 // --- Utility functions ---
 
