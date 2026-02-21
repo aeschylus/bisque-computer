@@ -2,41 +2,68 @@
 //!
 //! Renders Lobster instance data as a visual dashboard with panels for
 //! system info, message queues, sessions, tasks, and health status.
+//!
+//! Visual theme: bisque beige throughout, black text, doubled text sizes.
+//! Fonts: Optima for readable text, Monaco for monospace (font stacks with fallbacks).
+//! On app open: Ulysses splash quote fades in and out.
 
 use vello::kurbo::{Affine, Point, Rect, RoundedRect};
-use vello::peniko::{Color, Fill};
-use vello::Scene;
+use vello::peniko::{Color, Fill, FontData};
+use vello::{Glyph, Scene};
 
 use crate::protocol::{ConnectionStatus, LobsterInstance};
 use crate::ws_client::SharedInstances;
 
-// --- Color palette (warm bisque theme) ---
+// --- Color palette (bisque beige theme) ---
+// CSS bisque = rgb(255, 228, 196) = [1.0, 0.894, 0.769]
 
-const BG_COLOR: Color = Color::new([0.96, 0.93, 0.87, 1.0]);         // bisque background
-const PANEL_BG: Color = Color::new([1.0, 0.98, 0.95, 1.0]);          // warm white
-const PANEL_BORDER: Color = Color::new([0.85, 0.78, 0.68, 1.0]);     // tan border
-const HEADER_BG: Color = Color::new([0.36, 0.25, 0.20, 1.0]);        // dark brown
-const TEXT_PRIMARY: Color = Color::new([0.15, 0.12, 0.10, 1.0]);     // near-black
-const TEXT_SECONDARY: Color = Color::new([0.45, 0.40, 0.35, 1.0]);   // muted brown
-const TEXT_LIGHT: Color = Color::new([0.98, 0.96, 0.92, 1.0]);       // cream on dark
+const BG_COLOR: Color = Color::new([1.0, 0.894, 0.769, 1.0]);        // CSS bisque background
+const PANEL_BG: Color = Color::new([1.0, 0.922, 0.827, 1.0]);        // lighter bisque panel
+const PANEL_BORDER: Color = Color::new([0.87, 0.72, 0.53, 1.0]);     // warm tan border
+const HEADER_BG: Color = Color::new([0.80, 0.62, 0.40, 1.0]);        // warm bisque-brown header
+const TEXT_PRIMARY: Color = Color::new([0.0, 0.0, 0.0, 1.0]);        // pure black (#000000)
+const TEXT_SECONDARY: Color = Color::new([0.0, 0.0, 0.0, 0.65]);     // black at 65% opacity
+const TEXT_LIGHT: Color = Color::new([0.0, 0.0, 0.0, 1.0]);          // black on header
 const ACCENT_GREEN: Color = Color::new([0.20, 0.65, 0.32, 1.0]);     // healthy green
 const ACCENT_RED: Color = Color::new([0.80, 0.20, 0.18, 1.0]);       // alert red
 const ACCENT_AMBER: Color = Color::new([0.85, 0.60, 0.10, 1.0]);     // warning amber
 const ACCENT_BLUE: Color = Color::new([0.22, 0.46, 0.72, 1.0]);      // info blue
-const BAR_BG: Color = Color::new([0.90, 0.86, 0.80, 1.0]);           // bar background
-const SECTION_BG: Color = Color::new([0.98, 0.96, 0.93, 1.0]);       // section fill
+const BAR_BG: Color = Color::new([0.96, 0.87, 0.75, 1.0]);           // bisque bar background
+const SECTION_BG: Color = Color::new([1.0, 0.91, 0.80, 1.0]);        // bisque section fill
 
-// --- Layout constants ---
+// --- Layout constants (doubled text sizes) ---
 
 const MARGIN: f64 = 24.0;
 const PANEL_PADDING: f64 = 16.0;
 const PANEL_GAP: f64 = 16.0;
-const HEADER_HEIGHT: f64 = 48.0;
-const SECTION_HEIGHT: f64 = 32.0;
-const LINE_HEIGHT: f64 = 22.0;
-const BAR_HEIGHT: f64 = 14.0;
+const HEADER_HEIGHT: f64 = 72.0;       // taller for 2x text
+const SECTION_HEIGHT: f64 = 48.0;      // taller for 2x text
+const LINE_HEIGHT: f64 = 36.0;         // doubled from 22
+const BAR_HEIGHT: f64 = 20.0;          // slightly taller
 const CORNER_RADIUS: f64 = 8.0;
-const STATUS_DOT_RADIUS: f64 = 6.0;
+const STATUS_DOT_RADIUS: f64 = 8.0;    // slightly larger
+
+// --- Splash quote from James Joyce's Ulysses ---
+
+const ULYSSES_QUOTE: &str = "\
+I was a Flower of the mountain yes \
+when I put the rose in my hair like the Andalusian girls used \
+or shall I wear a red yes \
+and how he kissed me under the Moorish Wall \
+and I thought well as well him as another \
+and then I asked him with my eyes to ask again yes \
+and then he asked me would I yes to say yes \
+my mountain flower \
+and first I put my arms around him yes \
+and drew him down to me so he could feel my breasts all perfume yes \
+and his heart was going like mad \
+and yes I said yes I will Yes.";
+
+// Splash animation timing
+const FADE_IN_DURATION: f64 = 2.0;   // seconds to fade in
+const HOLD_DURATION: f64 = 4.0;      // seconds to hold at full opacity
+const FADE_OUT_DURATION: f64 = 2.0;  // seconds to fade out
+const TOTAL_SPLASH_DURATION: f64 = FADE_IN_DURATION + HOLD_DURATION + FADE_OUT_DURATION;
 
 /// Top-level render function: draws the full dashboard.
 pub fn render_dashboard(
@@ -44,23 +71,29 @@ pub fn render_dashboard(
     width: f64,
     height: f64,
     instances: &SharedInstances,
-    _elapsed: f64,
+    elapsed: f64,
+    font_data: Option<&FontData>,
 ) {
-    // Background fill
+    // Background fill - bisque beige
     let bg_rect = Rect::new(0.0, 0.0, width, height);
     scene.fill(Fill::NonZero, Affine::IDENTITY, BG_COLOR, None, &bg_rect);
+
+    // Ulysses splash quote overlay (fades in and out on app open)
+    if elapsed < TOTAL_SPLASH_DURATION {
+        draw_splash_quote(scene, width, height, elapsed, font_data);
+    }
 
     let instances = instances.lock().unwrap();
 
     if instances.is_empty() {
-        draw_centered_text(scene, width, height, "No Lobster instances configured", TEXT_SECONDARY, 20.0);
+        draw_centered_text(scene, width, height, "No Lobster instances configured", TEXT_SECONDARY, 40.0);
         return;
     }
 
     // Title bar
     let title_rect = Rect::new(0.0, 0.0, width, HEADER_HEIGHT);
     scene.fill(Fill::NonZero, Affine::IDENTITY, HEADER_BG, None, &title_rect);
-    draw_text(scene, MARGIN, 32.0, "LOBSTER DASHBOARD", TEXT_LIGHT, 22.0);
+    draw_text(scene, MARGIN, 50.0, "LOBSTER DASHBOARD", TEXT_LIGHT, 44.0);
 
     // Count connected instances
     let connected = instances
@@ -68,7 +101,7 @@ pub fn render_dashboard(
         .filter(|i| i.status == ConnectionStatus::Connected)
         .count();
     let status_text = format!("{}/{} connected", connected, instances.len());
-    draw_text(scene, width - 200.0, 32.0, &status_text, TEXT_LIGHT, 14.0);
+    draw_text(scene, width - 400.0, 50.0, &status_text, TEXT_LIGHT, 28.0);
 
     // Layout: panels in a grid
     let content_top = HEADER_HEIGHT + MARGIN;
@@ -135,7 +168,7 @@ fn draw_instance_panel(
     } else {
         &instance.url
     };
-    draw_text(scene, inner_x + 20.0, cursor_y + 15.0, hostname, TEXT_PRIMARY, 16.0);
+    draw_text(scene, inner_x + 24.0, cursor_y + 20.0, hostname, TEXT_PRIMARY, 32.0);
 
     // Connection status text
     let status_str = match &instance.status {
@@ -144,8 +177,8 @@ fn draw_instance_panel(
         ConnectionStatus::Disconnected => "disconnected".to_string(),
         ConnectionStatus::Error(e) => format!("error: {}", &e[..e.len().min(30)]),
     };
-    draw_text(scene, inner_x + 20.0, cursor_y + 30.0, &status_str, TEXT_SECONDARY, 11.0);
-    cursor_y += 42.0;
+    draw_text(scene, inner_x + 24.0, cursor_y + 48.0, &status_str, TEXT_SECONDARY, 22.0);
+    cursor_y += 60.0;
 
     if instance.status != ConnectionStatus::Connected {
         return;
@@ -192,7 +225,7 @@ fn draw_instance_panel(
         cursor_y += LINE_HEIGHT;
     }
     if session_count > 3 {
-        draw_text(scene, inner_x + 8.0, cursor_y, &format!("  +{} more", session_count - 3), TEXT_SECONDARY, 11.0);
+        draw_text(scene, inner_x + 8.0, cursor_y, &format!("  +{} more", session_count - 3), TEXT_SECONDARY, 22.0);
         cursor_y += LINE_HEIGHT;
     }
     cursor_y += 4.0;
@@ -414,34 +447,34 @@ fn draw_circle(scene: &mut Scene, cx: f64, cy: f64, r: f64, color: Color) {
 fn draw_section_header(scene: &mut Scene, x: f64, y: f64, w: f64, title: &str) -> f64 {
     let rect = RoundedRect::new(x, y, x + w, y + SECTION_HEIGHT - 4.0, 4.0);
     scene.fill(Fill::NonZero, Affine::IDENTITY, SECTION_BG, None, &rect);
-    draw_text(scene, x + 8.0, y + SECTION_HEIGHT - 12.0, title, TEXT_SECONDARY, 11.0);
+    draw_text(scene, x + 8.0, y + SECTION_HEIGHT - 16.0, title, TEXT_SECONDARY, 22.0);
     y + SECTION_HEIGHT
 }
 
 /// Draw a label: value pair.
 fn draw_label_value(scene: &mut Scene, x: f64, y: f64, label: &str, value: &str, _w: f64) {
-    draw_text(scene, x + 4.0, y + 14.0, label, TEXT_SECONDARY, 12.0);
-    // Right-align value
-    let value_width = value.len() as f64 * 7.0;
-    draw_text(scene, x + _w - value_width - 4.0, y + 14.0, value, TEXT_PRIMARY, 12.0);
+    draw_text(scene, x + 4.0, y + 24.0, label, TEXT_SECONDARY, 24.0);
+    // Right-align value (scaled for 2x text)
+    let value_width = value.len() as f64 * 14.0;
+    draw_text(scene, x + _w - value_width - 4.0, y + 24.0, value, TEXT_PRIMARY, 24.0);
 }
 
 /// Draw a label: value pair with custom value color.
 fn draw_label_value_colored(scene: &mut Scene, x: f64, y: f64, label: &str, value: &str, w: f64, color: Color) {
-    draw_text(scene, x + 4.0, y + 14.0, label, TEXT_SECONDARY, 12.0);
-    let value_width = value.len() as f64 * 7.0;
-    draw_text(scene, x + w - value_width - 4.0, y + 14.0, value, color, 12.0);
+    draw_text(scene, x + 4.0, y + 24.0, label, TEXT_SECONDARY, 24.0);
+    let value_width = value.len() as f64 * 14.0;
+    draw_text(scene, x + w - value_width - 4.0, y + 24.0, value, color, 24.0);
 }
 
 /// Draw a labeled progress bar.
 fn draw_label_bar(scene: &mut Scene, x: f64, y: f64, label: &str, percent: f64, w: f64, bar_color: Color) {
-    let label_w = 60.0;
-    draw_text(scene, x + 4.0, y + 14.0, label, TEXT_SECONDARY, 12.0);
+    let label_w = 120.0;  // doubled
+    draw_text(scene, x + 4.0, y + 24.0, label, TEXT_SECONDARY, 24.0);
 
     // Bar background
     let bar_x = x + label_w;
-    let bar_w = w - label_w - 50.0;
-    let bar_y = y + 4.0;
+    let bar_w = w - label_w - 80.0;
+    let bar_y = y + 8.0;
     let bg_rect = RoundedRect::new(bar_x, bar_y, bar_x + bar_w, bar_y + BAR_HEIGHT, 3.0);
     scene.fill(Fill::NonZero, Affine::IDENTITY, BAR_BG, None, &bg_rect);
 
@@ -454,7 +487,247 @@ fn draw_label_bar(scene: &mut Scene, x: f64, y: f64, label: &str, percent: f64, 
 
     // Percentage text
     let pct_str = format!("{:.0}%", percent);
-    draw_text(scene, x + w - 40.0, y + 14.0, &pct_str, TEXT_PRIMARY, 12.0);
+    draw_text(scene, x + w - 70.0, y + 24.0, &pct_str, TEXT_PRIMARY, 24.0);
+}
+
+// --- Splash quote rendering ---
+
+/// Compute the splash quote alpha based on elapsed time
+fn splash_alpha(elapsed: f64) -> f32 {
+    if elapsed >= TOTAL_SPLASH_DURATION {
+        return 0.0;
+    }
+    if elapsed < FADE_IN_DURATION {
+        // Fade in: 0 -> 1 with smooth ease-in-out cubic
+        let t = (elapsed / FADE_IN_DURATION) as f32;
+        ease_in_out(t)
+    } else if elapsed < FADE_IN_DURATION + HOLD_DURATION {
+        // Hold at full opacity
+        1.0
+    } else {
+        // Fade out: 1 -> 0
+        let t = ((elapsed - FADE_IN_DURATION - HOLD_DURATION) / FADE_OUT_DURATION) as f32;
+        1.0 - ease_in_out(t)
+    }
+}
+
+/// Smooth ease-in-out cubic curve
+fn ease_in_out(t: f32) -> f32 {
+    if t < 0.5 {
+        4.0 * t * t * t
+    } else {
+        1.0 - (-2.0 * t + 2.0).powi(3) / 2.0
+    }
+}
+
+/// Draw the Ulysses splash quote with fade animation.
+/// Uses real font rendering via vello's draw_glyphs API when a font is available,
+/// otherwise falls back to the bitmap font renderer.
+fn draw_splash_quote(
+    scene: &mut Scene,
+    width: f64,
+    height: f64,
+    elapsed: f64,
+    font_data: Option<&FontData>,
+) {
+    let alpha = splash_alpha(elapsed);
+    if alpha <= 0.001 {
+        return;
+    }
+
+    // Semi-transparent bisque overlay behind the quote
+    let overlay_color = Color::new([1.0_f32, 0.894, 0.769, alpha * 0.92]);
+    let overlay_rect = Rect::new(0.0, 0.0, width, height);
+    scene.fill(Fill::NonZero, Affine::IDENTITY, overlay_color, None, &overlay_rect);
+
+    let black_with_alpha = Color::new([0.0_f32, 0.0, 0.0, alpha]);
+
+    if let Some(font) = font_data {
+        // Use real font rendering (Optima on macOS)
+        let font_size: f32 = 48.0;
+        let max_text_width = width * 0.7;
+        let start_x = width * 0.15;
+        let start_y = height * 0.25;
+
+        let glyphs = layout_text_with_font(
+            ULYSSES_QUOTE,
+            font,
+            font_size,
+            max_text_width,
+            start_x,
+            start_y,
+        );
+
+        if !glyphs.is_empty() {
+            scene
+                .draw_glyphs(font)
+                .font_size(font_size)
+                .brush(&black_with_alpha)
+                .draw(Fill::NonZero, glyphs.into_iter());
+        }
+    } else {
+        // Fallback: use bitmap font rendering
+        let font_size = 32.0; // doubled from 16
+        let max_chars_per_line = ((width * 0.7) / (font_size * 0.6)) as usize;
+        let start_x = width * 0.15;
+        let mut y = height * 0.20;
+        let line_height_px = font_size * 1.5;
+
+        // Simple word wrapping for bitmap font
+        let words: Vec<&str> = ULYSSES_QUOTE.split_whitespace().collect();
+        let mut line = String::new();
+
+        for word in &words {
+            if line.len() + word.len() + 1 > max_chars_per_line && !line.is_empty() {
+                draw_text(scene, start_x, y, &line, black_with_alpha, font_size);
+                y += line_height_px;
+                line.clear();
+            }
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(word);
+        }
+        if !line.is_empty() {
+            draw_text(scene, start_x, y, &line, black_with_alpha, font_size);
+        }
+    }
+}
+
+/// Layout text using a real font via skrifa for glyph metrics.
+/// Maps characters to glyph IDs and positions them with word wrapping.
+fn layout_text_with_font(
+    text: &str,
+    font_data: &FontData,
+    font_size: f32,
+    max_width: f64,
+    start_x: f64,
+    start_y: f64,
+) -> Vec<Glyph> {
+    let font_ref = skrifa::FontRef::from_index(font_data.data.as_ref(), font_data.index);
+    let font_ref = match font_ref {
+        Ok(f) => f,
+        Err(_) => return vec![],
+    };
+
+    use skrifa::MetadataProvider;
+    let charmap = font_ref.charmap();
+    let glyph_metrics = font_ref.glyph_metrics(
+        skrifa::instance::Size::new(font_size),
+        skrifa::instance::LocationRef::default(),
+    );
+
+    let mut glyphs = Vec::new();
+    let mut x = start_x;
+    let mut y = start_y;
+    let line_height = font_size as f64 * 1.4;
+
+    let words: Vec<&str> = text.split_whitespace().collect();
+
+    for (i, word) in words.iter().enumerate() {
+        // Measure word width
+        let word_width: f64 = word
+            .chars()
+            .map(|ch| {
+                let gid = charmap.map(ch).unwrap_or_default();
+                glyph_metrics
+                    .advance_width(gid)
+                    .unwrap_or(font_size * 0.5) as f64
+            })
+            .sum();
+
+        let space_gid = charmap.map(' ').unwrap_or_default();
+        let space_width = glyph_metrics
+            .advance_width(space_gid)
+            .unwrap_or(font_size * 0.25) as f64;
+
+        let needed = if i > 0 && x > start_x {
+            space_width + word_width
+        } else {
+            word_width
+        };
+        if x + needed > start_x + max_width && x > start_x {
+            x = start_x;
+            y += line_height;
+        } else if i > 0 && x > start_x {
+            x += space_width;
+        }
+
+        for ch in word.chars() {
+            let gid = charmap.map(ch).unwrap_or_default();
+            let advance = glyph_metrics
+                .advance_width(gid)
+                .unwrap_or(font_size * 0.5) as f64;
+
+            glyphs.push(Glyph {
+                id: gid.to_u32(),
+                x: x as f32,
+                y: y as f32,
+            });
+
+            x += advance;
+        }
+    }
+
+    glyphs
+}
+
+// --- Font loading ---
+
+/// Try to load a font from common system paths.
+/// On macOS: Optima and Monaco are system fonts.
+/// Falls back to Linux system fonts for development.
+fn load_system_font(font_names: &[&str]) -> Option<FontData> {
+    let macos_dirs = [
+        "/System/Library/Fonts/",
+        "/System/Library/Fonts/Supplemental/",
+        "/Library/Fonts/",
+    ];
+    let linux_dirs = [
+        "/usr/share/fonts/truetype/dejavu/",
+        "/usr/share/fonts/truetype/",
+        "/usr/share/fonts/opentype/",
+    ];
+    let extensions = ["ttf", "otf", "ttc"];
+    let all_dirs: Vec<&str> = macos_dirs.iter().chain(linux_dirs.iter()).copied().collect();
+
+    for name in font_names {
+        for dir in &all_dirs {
+            for ext in &extensions {
+                let path = format!("{}{}.{}", dir, name, ext);
+                if let Ok(data) = std::fs::read(&path) {
+                    return Some(FontData::new(data.into(), 0));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Load the best available font for readable text.
+/// Font stack: Optima > Helvetica > Arial > DejaVu Sans > Liberation Sans
+pub fn load_readable_font() -> Option<FontData> {
+    load_system_font(&[
+        "Optima",
+        "Optima Regular",
+        "Helvetica",
+        "Arial",
+        "DejaVuSans",
+        "LiberationSans-Regular",
+    ])
+}
+
+/// Load the best available font for monospace/computery text.
+/// Font stack: Monaco > Menlo > DejaVu Sans Mono > Liberation Mono
+#[allow(dead_code)]
+pub fn load_mono_font() -> Option<FontData> {
+    load_system_font(&[
+        "Monaco",
+        "Menlo",
+        "Menlo-Regular",
+        "DejaVuSansMono",
+        "LiberationMono-Regular",
+    ])
 }
 
 // --- Utility functions ---

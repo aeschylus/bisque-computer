@@ -15,6 +15,7 @@ use clap::Parser;
 use std::sync::Arc;
 use std::time::Instant;
 use vello::peniko::color::palette;
+use vello::peniko::FontData;
 use vello::util::{RenderContext, RenderSurface};
 use vello::{AaConfig, Renderer, RendererOptions, Scene};
 use winit::application::ApplicationHandler;
@@ -58,6 +59,7 @@ struct App {
     start_time: Instant,
     instances: SharedInstances,
     windowed: bool,
+    font_data: Option<FontData>,
 }
 
 impl ApplicationHandler for App {
@@ -167,6 +169,7 @@ impl ApplicationHandler for App {
                     height,
                     &self.instances,
                     elapsed,
+                    self.font_data.as_ref(),
                 );
 
                 let device_handle = &self.context.devices[surface.dev_id];
@@ -180,7 +183,7 @@ impl ApplicationHandler for App {
                         &self.scene,
                         &surface.target_view,
                         &vello::RenderParams {
-                            base_color: palette::css::WHITE,
+                            base_color: palette::css::BISQUE,
                             width: surface.config.width,
                             height: surface.config.height,
                             antialiasing_method: AaConfig::Msaa16,
@@ -246,6 +249,14 @@ fn main() -> Result<()> {
     // Spawn WebSocket client tasks
     let instances = ws_client::spawn_clients(&runtime, endpoints);
 
+    // Load fonts at startup
+    // Optima for readable text (splash quote), Monaco for monospace (future use)
+    let font_data = dashboard::load_readable_font();
+    if font_data.is_none() {
+        eprintln!("Note: No system font found (Optima/Helvetica/DejaVu Sans).");
+        eprintln!("Splash quote will use bitmap font fallback.");
+    }
+
     let mut app = App {
         context: RenderContext::new(),
         renderers: vec![],
@@ -254,6 +265,7 @@ fn main() -> Result<()> {
         start_time: Instant::now(),
         instances,
         windowed: args.windowed,
+        font_data,
     };
 
     let event_loop = EventLoop::new()?;

@@ -26,3 +26,7 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # CLI argument parsing
 clap = { version = "4", features = ["derive"] }
+
+# Font rendering
+skrifa = "0.40.0"
+peniko = "0.6.0"
