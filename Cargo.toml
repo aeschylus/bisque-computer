@@ -1,6 +1,6 @@
 [package]
 name = "bisque-computer"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 
 [dependencies]
@@ -8,3 +8,21 @@ vello = "0.7.0"
 winit = "0.30.12"
 pollster = "0.4.0"
 anyhow = "1.0"
+
+# Async runtime for WebSocket client
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+
+# WebSocket client
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "handshake"] }
+futures-util = "0.3"
+url = "2"
+
+# JSON parsing
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# CLI argument parsing
+clap = { version = "4", features = ["derive"] }

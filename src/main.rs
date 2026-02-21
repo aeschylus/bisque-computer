@@ -1,8 +1,19 @@
+//! bisque-computer: Lobster Instance Dashboard
+//!
+//! A GPU-rendered fullscreen dashboard that connects to one or more Lobster
+//! Dashboard WebSocket servers and visualizes system state in real time.
+//!
+//! Uses vello/wgpu for rendering and tokio-tungstenite for WebSocket communication.
+
+mod dashboard;
+#[allow(dead_code)]
+mod protocol;
+mod ws_client;
+
 use anyhow::Result;
+use clap::Parser;
 use std::sync::Arc;
 use std::time::Instant;
-use vello::kurbo::{Affine, BezPath, Point};
-use vello::peniko::Color;
 use vello::peniko::color::palette;
 use vello::util::{RenderContext, RenderSurface};
 use vello::{AaConfig, Renderer, RendererOptions, Scene};
@@ -13,6 +24,21 @@ use winit::keyboard::{Key, NamedKey};
 use winit::window::{Fullscreen, Window};
 
 use vello::wgpu;
+
+use ws_client::SharedInstances;
+
+/// Lobster Instance Dashboard
+#[derive(Parser, Debug)]
+#[command(name = "bisque-computer", version, about = "Lobster Instance Dashboard")]
+struct Args {
+    /// WebSocket endpoint URLs to connect to (e.g., ws://localhost:9100)
+    #[arg(short, long, default_value = "ws://localhost:9100")]
+    endpoints: Vec<String>,
+
+    /// Start in windowed mode instead of fullscreen
+    #[arg(short, long)]
+    windowed: bool,
+}
 
 #[derive(Debug)]
 enum RenderState {
@@ -30,6 +56,8 @@ struct App {
     state: RenderState,
     scene: Scene,
     start_time: Instant,
+    instances: SharedInstances,
+    windowed: bool,
 }
 
 impl ApplicationHandler for App {
@@ -40,7 +68,7 @@ impl ApplicationHandler for App {
 
         let window = cached_window
             .take()
-            .unwrap_or_else(|| create_window(event_loop));
+            .unwrap_or_else(|| create_window(event_loop, self.windowed));
 
         let size = window.inner_size();
         let surface_future = self.context.create_surface(
@@ -97,6 +125,20 @@ impl ApplicationHandler for App {
                 ..
             } => event_loop.exit(),
 
+            // Press 'R' to request a fresh snapshot from all servers
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        logical_key: Key::Character(ref c),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } if c.as_str() == "r" || c.as_str() == "R" => {
+                // Could send request_snapshot to all connections
+                // For now, updates come automatically
+            }
+
             WindowEvent::Resized(size) => {
                 if size.width != 0 && size.height != 0 {
                     self.context
@@ -118,7 +160,14 @@ impl ApplicationHandler for App {
                 let height = surface.config.height as f64;
                 let elapsed = self.start_time.elapsed().as_secs_f64();
 
-                add_spinning_triangle(&mut self.scene, width, height, elapsed);
+                // Render the dashboard
+                dashboard::render_dashboard(
+                    &mut self.scene,
+                    width,
+                    height,
+                    &self.instances,
+                    elapsed,
+                );
 
                 let device_handle = &self.context.devices[surface.dev_id];
 
@@ -162,7 +211,7 @@ impl ApplicationHandler for App {
                 surface_texture.present();
                 device_handle.device.poll(wgpu::PollType::Poll).unwrap();
 
-                // Request another frame for continuous animation
+                // Request another frame for continuous updates
                 window.request_redraw();
             }
 
@@ -172,25 +221,61 @@ impl ApplicationHandler for App {
 }
 
 fn main() -> Result<()> {
+    let args = Args::parse();
+
+    // Create the Tokio runtime for async WebSocket clients
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("Failed to create Tokio runtime");
+
+    // Parse endpoint URLs
+    let endpoints = if args.endpoints.len() == 1 && args.endpoints[0] == "ws://localhost:9100" {
+        // Default: single local instance
+        vec!["ws://localhost:9100".to_string()]
+    } else {
+        args.endpoints
+    };
+
+    println!("bisque-computer v{}", env!("CARGO_PKG_VERSION"));
+    println!("Connecting to {} endpoint(s):", endpoints.len());
+    for ep in &endpoints {
+        println!("  - {}", ep);
+    }
+
+    // Spawn WebSocket client tasks
+    let instances = ws_client::spawn_clients(&runtime, endpoints);
+
     let mut app = App {
         context: RenderContext::new(),
         renderers: vec![],
         state: RenderState::Suspended(None),
         scene: Scene::new(),
         start_time: Instant::now(),
+        instances,
+        windowed: args.windowed,
     };
 
     let event_loop = EventLoop::new()?;
     event_loop
         .run_app(&mut app)
         .expect("Couldn't run event loop");
+
+    // Clean shutdown of the Tokio runtime
+    runtime.shutdown_timeout(std::time::Duration::from_secs(1));
+
     Ok(())
 }
 
-fn create_window(event_loop: &ActiveEventLoop) -> Arc<Window> {
-    let attr = Window::default_attributes()
-        .with_fullscreen(Some(Fullscreen::Borderless(None)))
-        .with_title("bisque-computer");
+fn create_window(event_loop: &ActiveEventLoop, windowed: bool) -> Arc<Window> {
+    let mut attr = Window::default_attributes().with_title("bisque-computer | Lobster Dashboard");
+
+    if !windowed {
+        attr = attr.with_fullscreen(Some(Fullscreen::Borderless(None)));
+    } else {
+        attr = attr.with_inner_size(winit::dpi::LogicalSize::new(1280, 800));
+    }
+
     Arc::new(event_loop.create_window(attr).unwrap())
 }
 
@@ -200,44 +285,4 @@ fn create_renderer(render_cx: &RenderContext, surface: &RenderSurface<'_>) -> Re
         RendererOptions::default(),
     )
     .expect("Couldn't create renderer")
-}
-
-/// Draw a black equilateral triangle centered on the screen, rotating over time.
-fn add_spinning_triangle(scene: &mut Scene, width: f64, height: f64, elapsed: f64) {
-    let cx = width / 2.0;
-    let cy = height / 2.0;
-    let radius = width.min(height) * 0.3;
-    let angle = elapsed * 1.5; // radians per second
-
-    // Three vertices of an equilateral triangle, centered at origin
-    let offsets: [(f64, f64); 3] = [
-        (0.0, -radius),
-        (radius * 0.866, radius * 0.5),
-        (-radius * 0.866, radius * 0.5),
-    ];
-
-    // Rotate each vertex by the current angle, then translate to center
-    let vertices: Vec<Point> = offsets
-        .iter()
-        .map(|&(x, y)| {
-            let rx = x * angle.cos() - y * angle.sin();
-            let ry = x * angle.sin() + y * angle.cos();
-            Point::new(cx + rx, cy + ry)
-        })
-        .collect();
-
-    let mut path = BezPath::new();
-    path.move_to(vertices[0]);
-    path.line_to(vertices[1]);
-    path.line_to(vertices[2]);
-    path.close_path();
-
-    let black = Color::new([0.0, 0.0, 0.0, 1.0]);
-    scene.fill(
-        vello::peniko::Fill::NonZero,
-        Affine::IDENTITY,
-        black,
-        None,
-        &path,
-    );
 }
