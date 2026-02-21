@@ -11,28 +11,28 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: macos-latest
-            arch: aarch64
+          - arch: aarch64
             target: aarch64-apple-darwin
-          - os: macos-13
-            arch: x86_64
+          - arch: x86_64
             target: x86_64-apple-darwin
-    runs-on: ${{ matrix.os }}
+    runs-on: macos-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - name: Build release binary
-        run: cargo build --release
+        run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package binary
         run: |
-          cd target/release
+          cd target/${{ matrix.target }}/release
           tar czf bisque-computer-${{ matrix.arch }}-apple-darwin.tar.gz bisque-computer
-          mv bisque-computer-${{ matrix.arch }}-apple-darwin.tar.gz ../../
+          mv bisque-computer-${{ matrix.arch }}-apple-darwin.tar.gz ../../../
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
