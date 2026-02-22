@@ -624,7 +624,22 @@ fn main() -> Result<()> {
         }
     }
 
-    // Spawn WebSocket client tasks
+    // Voice config — derive whisper host before endpoints is consumed by spawn_clients.
+    let mut voice_config = VoiceConfig::default();
+    if args.no_voice {
+        voice_config.enabled = false;
+    }
+    // The same server that hosts the Lobster dashboard also runs whisper.cpp,
+    // so extract the host from the WebSocket URL and route whisper calls there.
+    if app_mode == AppMode::Dashboard && !endpoints.is_empty() {
+        if let Ok(parsed) = url::Url::parse(&endpoints[0]) {
+            if let Some(h) = parsed.host_str() {
+                voice_config.whisper_host = h.to_string();
+            }
+        }
+    }
+
+    // Spawn WebSocket client tasks (consumes `endpoints`)
     let (instances, outbound) = ws_client::spawn_clients(&runtime, endpoints);
 
     // Load fonts at startup
@@ -641,22 +656,6 @@ fn main() -> Result<()> {
         println!("Loaded monospace font (Monaco/Menlo/DejaVu Sans Mono)");
     } else {
         eprintln!("Note: No monospace font found (Monaco/Menlo/DejaVu Sans Mono).");
-    }
-
-    // Voice config
-    let mut voice_config = VoiceConfig::default();
-    if args.no_voice {
-        voice_config.enabled = false;
-    }
-
-    // Derive whisper host from the WebSocket endpoint host — the same server
-    // that runs the Lobster dashboard also runs the whisper.cpp HTTP server.
-    if app_mode == AppMode::Dashboard && !endpoints.is_empty() {
-        if let Ok(parsed) = url::Url::parse(&endpoints[0]) {
-            if let Some(h) = parsed.host_str() {
-                voice_config.whisper_host = h.to_string();
-            }
-        }
     }
 
     if voice_config.enabled {
