@@ -1,6 +1,6 @@
 [package]
 name = "bisque-computer"
-version = "0.6.2"
+version = "0.7.0"
 edition = "2024"
 
 [dependencies]
@@ -24,6 +24,11 @@ serde_json = "1"
 # Time handling
 chrono = { version = "0.4", features = ["serde"] }
 
+# Structured logging (dev file logging via BISQUE_LOG=1)
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "ansi"] }
+tracing-appender = "0.2"
+
 # CLI argument parsing
 clap = { version = "4", features = ["derive"] }
 
@@ -33,6 +38,12 @@ arboard = "3"
 # Font rendering
 skrifa = "0.40.0"
 peniko = "0.6.0"
+
+# Hierarchical state machine for app-level state management
+statig = "0.4"
+
+# Text layout and interactive text selection
+parley = "0.7.0"
 
 # Voice input: audio capture, WAV encoding, HTTP transcription
 cpal = "0.15"

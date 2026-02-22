@@ -9,15 +9,33 @@
 //!
 //! On first launch (no config file), shows a setup screen where the user enters
 //! the connection URL. The URL is saved to `~/.config/bisque-computer/server`.
+//!
+//! ## State Management
+//!
+//! All app-level state is modelled with `statig` hierarchical state machines
+//! defined in `state_machine.rs`:
+//!
+//! - `VoiceMachine`: voice input lifecycle (disabled <-> idle <-> recording <->
+//!   transcribing <-> done/error)
+//! - `AppModeMachine`: display mode (setup -> dashboard)
+//!
+//! Mouse events for text selection are routed through `text_selection::SelectableText`
+//! instances, backed by `parley::PlainEditor`.
 
 mod dashboard;
+mod logging;
 #[allow(dead_code)]
 mod protocol;
+mod state_machine;
+mod text_selection;
 mod voice;
 mod ws_client;
 
 use anyhow::Result;
 use clap::Parser;
+use statig::prelude::*;
+use statig::blocking::StateMachine;
+use tracing::{error, info, warn};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -26,15 +44,18 @@ use vello::peniko::FontData;
 use vello::util::{RenderContext, RenderSurface};
 use vello::{AaConfig, Renderer, RendererOptions, Scene};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, KeyEvent, Modifiers, WindowEvent};
+use winit::dpi::PhysicalPosition;
+use winit::event::{ElementState, KeyEvent, Modifiers, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Fullscreen, Window};
 
 use vello::wgpu;
 
-use voice::{VoiceConfig, VoiceUiState};
-use ws_client::{OutboundSender, SharedInstances};
+use state_machine::{AppModeEvent, AppModeMachine, VoiceEvent, VoiceMachine};
+use state_machine::voice_sm::State as VoiceState;
+use state_machine::app_mode_sm::State as AppModeState;
+use text_selection::{ParleyCtx, SelectableText};
 
 // ---------------------------------------------------------------------------
 // Config file helpers
@@ -50,11 +71,9 @@ fn config_file_path() -> PathBuf {
 
 /// Return the OS-appropriate config base directory.
 fn config_base_dir() -> PathBuf {
-    // Respect XDG_CONFIG_HOME if set (Linux/CI)
     if let Ok(val) = std::env::var("XDG_CONFIG_HOME") {
         return PathBuf::from(val);
     }
-    // macOS: ~/Library/Application Support
     #[cfg(target_os = "macos")]
     {
         let mut p = home_dir();
@@ -62,7 +81,6 @@ fn config_base_dir() -> PathBuf {
         p.push("Application Support");
         return p;
     }
-    // Linux and others: ~/.config
     #[allow(unreachable_code)]
     {
         let mut p = home_dir();
@@ -77,8 +95,6 @@ fn home_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("/tmp"))
 }
 
-/// Read the saved server URL from `~/.config/bisque-computer/server`.
-/// Returns `None` when the file is absent or empty.
 fn read_saved_server_url() -> Option<String> {
     let path = config_file_path();
     if !path.exists() {
@@ -88,7 +104,6 @@ fn read_saved_server_url() -> Option<String> {
     if url.is_empty() { None } else { Some(url) }
 }
 
-/// Persist `url` to `~/.config/bisque-computer/server`, creating dirs as needed.
 fn save_server_url(url: &str) -> Result<()> {
     let path = config_file_path();
     if let Some(parent) = path.parent() {
@@ -99,17 +114,8 @@ fn save_server_url(url: &str) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Application mode
+// CLI
 // ---------------------------------------------------------------------------
-
-/// Determines which screen is currently active.
-#[derive(Debug, PartialEq, Eq)]
-enum AppMode {
-    /// Normal dashboard: connected (or connecting) to a Lobster server.
-    Dashboard,
-    /// First-run setup: waiting for the user to paste a connection URL.
-    Setup,
-}
 
 /// Lobster Instance Dashboard
 #[derive(Parser, Debug)]
@@ -128,6 +134,10 @@ struct Args {
     no_voice: bool,
 }
 
+// ---------------------------------------------------------------------------
+// Render surface lifecycle
+// ---------------------------------------------------------------------------
+
 #[derive(Debug)]
 enum RenderState {
     Active {
@@ -138,123 +148,118 @@ enum RenderState {
     Suspended(Option<Arc<Window>>),
 }
 
+// ---------------------------------------------------------------------------
+// App
+// ---------------------------------------------------------------------------
+
 struct App {
+    // --- Rendering infrastructure ---
     context: RenderContext,
     renderers: Vec<Option<Renderer>>,
-    state: RenderState,
+    render_state: RenderState,
     scene: Scene,
     start_time: Instant,
-    instances: SharedInstances,
-    outbound: OutboundSender,
     windowed: bool,
-    /// Readable font (Optima on macOS, fallbacks on other platforms)
     font_data: Option<FontData>,
-    /// Monospace font (Monaco on macOS, fallbacks on other platforms)
     #[allow(dead_code)]
     mono_font_data: Option<FontData>,
 
-    // --- Voice input state ---
-    voice_config: VoiceConfig,
-    /// Current modifier state (tracks Shift held).
-    modifiers: Modifiers,
-    /// Live recording session; `Some` while Shift+Enter is held.
-    recording: Option<voice::RecordingState>,
-    /// UI feedback state for the dashboard renderer.
-    voice_ui: VoiceUiState,
-    /// Tokio runtime handle for spawning async transcription tasks.
-    rt_handle: tokio::runtime::Handle,
-    /// Channel for receiving transcription results from the async task.
-    transcription_rx: std::sync::mpsc::Receiver<Result<voice::TranscriptionResult, String>>,
-    transcription_tx: std::sync::mpsc::SyncSender<Result<voice::TranscriptionResult, String>>,
+    // --- State machines ---
+    voice_machine: StateMachine<VoiceMachine>,
+    app_mode_machine: StateMachine<AppModeMachine>,
 
-    // --- Setup mode state ---
-    /// Current application mode.
-    app_mode: AppMode,
-    /// Characters typed in the setup URL field.
+    // --- Input ---
+    modifiers: Modifiers,
+    cursor_pos: PhysicalPosition<f64>,
+
+    // --- Text selection ---
+    parley_ctx: ParleyCtx,
+    selectable_regions: Vec<SelectableText>,
+
+    // --- Setup mode ---
     setup_input: String,
 }
 
 impl App {
-    /// Begin audio capture. Called on Shift+Enter keydown.
-    fn start_recording(&mut self) {
-        if !self.voice_config.enabled {
-            return;
+    fn is_dashboard(&self) -> bool {
+        matches!(self.app_mode_machine.state(), AppModeState::Dashboard {})
+    }
+
+    fn voice_enabled(&self) -> bool {
+        !matches!(self.voice_machine.state(), VoiceState::Disabled {})
+    }
+
+    fn handle_voice_event(&mut self, event: VoiceEvent) {
+        self.voice_machine.handle(&event);
+    }
+
+    fn poll_transcription(&mut self) {
+        let maybe_event = self.voice_machine.inner().poll_transcription();
+        if let Some(event) = maybe_event {
+            self.voice_machine.handle(&event);
         }
-        if self.recording.is_some() {
-            return; // already recording
-        }
-        match voice::start_recording() {
-            Ok(rec) => {
-                self.recording = Some(rec);
-                self.voice_ui = VoiceUiState::Recording;
-                println!("[voice] Recording started");
-            }
-            Err(e) => {
-                eprintln!("[voice] Failed to start recording: {}", e);
-                self.voice_ui = VoiceUiState::Error(e.to_string());
+    }
+
+    fn copy_selection_to_clipboard(&self) {
+        for region in &self.selectable_regions {
+            if let Some(text) = region.selected_text() {
+                if !text.is_empty() {
+                    match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(text.to_string())) {
+                        Ok(()) => info!(target: "selection", "Copied {} chars to clipboard", text.len()),
+                        Err(e) => error!(target: "selection", "Clipboard write failed: {}", e),
+                    }
+                    return;
+                }
             }
         }
     }
 
-    /// Stop audio capture and spawn async transcription. Called on key release.
-    fn stop_and_transcribe(&mut self) {
-        let rec = match self.recording.take() {
-            Some(r) => r,
-            None => return,
+    fn rebuild_selectable_regions(&mut self, width: f64) {
+        self.selectable_regions.clear();
+
+        let instances = {
+            let guard = match self.app_mode_machine.inner().instances.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            let v: Vec<crate::protocol::LobsterInstance> = guard.clone();
+            v
         };
 
-        self.voice_ui = VoiceUiState::Transcribing;
-        println!("[voice] Recording stopped, transcribing...");
-
-        let samples = voice::stop_and_collect(&rec);
-        let sample_rate = rec.sample_rate;
-        let channels = rec.channels;
-        let config = self.voice_config.clone();
-        let tx = self.transcription_tx.clone();
-
-        self.rt_handle.spawn(async move {
-            let result: Result<voice::TranscriptionResult, String> = async {
-                let wav = voice::encode_to_wav(&samples, sample_rate, channels)
-                    .map_err(|e| e.to_string())?;
-                voice::transcribe(wav, &config)
-                    .await
-                    .map_err(|e| e.to_string())
-            }
-            .await;
-            let _ = tx.send(result);
-        });
-    }
-
-    /// Poll the transcription channel and handle any completed result.
-    ///
-    /// Called every frame from `window_event` RedrawRequested.
-    fn poll_transcription(&mut self) {
-        match self.transcription_rx.try_recv() {
-            Ok(Ok(result)) => {
-                let text = result.text.clone();
-                println!("[voice] Transcribed: {:?}", text);
-
-                if !text.is_empty() {
-                    let msg = protocol::VoiceInputMessage::new(text.clone());
-                    self.outbound.broadcast(msg.to_json());
+        for (i, inst) in instances.iter().enumerate() {
+            let text = format!(
+                "{} — {}",
+                inst.url,
+                match &inst.status {
+                    crate::protocol::ConnectionStatus::Connected =>
+                        inst.state.system.hostname.clone(),
+                    crate::protocol::ConnectionStatus::Connecting =>
+                        "connecting...".to_string(),
+                    crate::protocol::ConnectionStatus::Disconnected =>
+                        "disconnected".to_string(),
+                    crate::protocol::ConnectionStatus::Error(e) =>
+                        format!("error: {}", &e[..e.len().min(40)]),
                 }
+            );
 
-                self.voice_ui = VoiceUiState::Done(text);
-            }
-            Ok(Err(e)) => {
-                eprintln!("[voice] Transcription failed: {}", e);
-                self.voice_ui = VoiceUiState::Error(e);
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {}
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+            let origin = (24.0, 80.0 + i as f64 * 60.0);
+            let max_w = (width - 48.0) as f32;
+
+            let region = SelectableText::new(
+                &text,
+                28.0,
+                origin,
+                Some(max_w),
+                &mut self.parley_ctx,
+            );
+            self.selectable_regions.push(region);
         }
     }
-
 }
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        let RenderState::Suspended(cached_window) = &mut self.state else {
+        let RenderState::Suspended(cached_window) = &mut self.render_state else {
             return;
         };
 
@@ -276,7 +281,7 @@ impl ApplicationHandler for App {
         self.renderers[surface.dev_id]
             .get_or_insert_with(|| create_renderer(&self.context, &surface));
 
-        self.state = RenderState::Active {
+        self.render_state = RenderState::Active {
             surface: Box::new(surface),
             valid_surface: true,
             window,
@@ -284,8 +289,8 @@ impl ApplicationHandler for App {
     }
 
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
-        if let RenderState::Active { window, .. } = &self.state {
-            self.state = RenderState::Suspended(Some(window.clone()));
+        if let RenderState::Active { window, .. } = &self.render_state {
+            self.render_state = RenderState::Suspended(Some(window.clone()));
         }
     }
 
@@ -295,8 +300,7 @@ impl ApplicationHandler for App {
         window_id: winit::window::WindowId,
         event: WindowEvent,
     ) {
-        // Verify this event is for our window
-        let is_our_window = match &self.state {
+        let is_our_window = match &self.render_state {
             RenderState::Active { window, .. } => window.id() == window_id,
             _ => false,
         };
@@ -305,20 +309,47 @@ impl ApplicationHandler for App {
         }
 
         match event {
+            // ----------------------------------------------------------------
+            // Window lifecycle
+            // ----------------------------------------------------------------
             WindowEvent::CloseRequested => event_loop.exit(),
 
-            // Track modifier state for push-to-talk detection.
+            WindowEvent::Resized(size) => {
+                if let RenderState::Active {
+                    surface,
+                    valid_surface,
+                    ..
+                } = &mut self.render_state
+                {
+                    if size.width != 0 && size.height != 0 {
+                        self.context.resize_surface(surface, size.width, size.height);
+                        *valid_surface = true;
+                    } else {
+                        *valid_surface = false;
+                    }
+                }
+            }
+
+            // ----------------------------------------------------------------
+            // Modifier tracking
+            // ----------------------------------------------------------------
             WindowEvent::ModifiersChanged(new_mods) => {
                 let shift_was_held = self.modifiers.state().shift_key();
                 self.modifiers = new_mods;
                 let shift_now_held = self.modifiers.state().shift_key();
 
-                // If Shift was released while recording, stop and transcribe.
-                if shift_was_held && !shift_now_held && self.recording.is_some() {
-                    self.stop_and_transcribe();
+                if self.is_dashboard()
+                    && shift_was_held
+                    && !shift_now_held
+                    && matches!(self.voice_machine.state(), VoiceState::Recording {})
+                {
+                    self.handle_voice_event(VoiceEvent::StopRecording);
                 }
             }
 
+            // ----------------------------------------------------------------
+            // Global hotkeys
+            // ----------------------------------------------------------------
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -330,9 +361,8 @@ impl ApplicationHandler for App {
             } => event_loop.exit(),
 
             // ----------------------------------------------------------------
-            // Setup mode: capture keyboard input for the URL field.
+            // Setup mode: URL input
             // ----------------------------------------------------------------
-
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -341,7 +371,7 @@ impl ApplicationHandler for App {
                         ..
                     },
                 ..
-            } if self.app_mode == AppMode::Setup => {
+            } if matches!(self.app_mode_machine.state(), AppModeState::Setup {}) => {
                 self.setup_input.pop();
             }
 
@@ -353,40 +383,38 @@ impl ApplicationHandler for App {
                         ..
                     },
                 ..
-            } if self.app_mode == AppMode::Setup => {
+            } if matches!(self.app_mode_machine.state(), AppModeState::Setup {}) => {
                 let url = self.setup_input.trim().to_string();
                 if url.starts_with("ws://") || url.starts_with("wss://") {
                     match save_server_url(&url) {
                         Ok(()) => {
-                            println!("[setup] Saved server URL: {}", url);
-                            // Extract whisper host from the WebSocket URL host.
+                            info!(target: "setup", "Saved server URL: {}", url);
+
                             if let Ok(parsed) = url::Url::parse(&url) {
                                 if let Some(h) = parsed.host_str() {
-                                    self.voice_config.whisper_host = h.to_string();
-                                    println!("[setup] whisper host set to: {}", h);
+                                    // SAFETY: we are not inside a statig state handler.
+                                    unsafe {
+                                        self.voice_machine.inner_mut().config.whisper_host =
+                                            h.to_string();
+                                    }
+                                    info!(target: "setup", "whisper host set to: {}", h);
                                 }
                             }
-                            // Spawn a fresh WebSocket client for the saved URL.
-                            let rt = tokio::runtime::Builder::new_multi_thread()
-                                .enable_all()
-                                .build()
-                                .expect("Failed to create runtime for setup");
-                            let (instances, outbound) =
-                                ws_client::spawn_clients(&rt, vec![url.clone()]);
-                            // Leak the runtime so the spawned tasks keep running.
-                            std::mem::forget(rt);
-                            self.instances = instances;
-                            self.outbound = outbound;
-                            self.app_mode = AppMode::Dashboard;
+
+                            // SAFETY: we are not inside a statig state handler.
+                            unsafe {
+                                self.app_mode_machine.inner_mut().setup_input = url.clone();
+                            }
+                            self.app_mode_machine.handle(&AppModeEvent::UrlSubmitted(url));
                         }
-                        Err(e) => eprintln!("[setup] Failed to save server URL: {}", e),
+                        Err(e) => error!(target: "setup", "Failed to save server URL: {}", e),
                     }
                 } else {
-                    eprintln!("[setup] URL must start with ws:// or wss://");
+                    warn!(target: "setup", "URL must start with ws:// or wss://");
                 }
             }
 
-            // Cmd+V (macOS) or Ctrl+V (Linux/Windows): paste from clipboard in Setup mode.
+            // Cmd+V / Ctrl+V paste in setup mode.
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -395,7 +423,7 @@ impl ApplicationHandler for App {
                         ..
                     },
                 ..
-            } if self.app_mode == AppMode::Setup
+            } if matches!(self.app_mode_machine.state(), AppModeState::Setup {})
                 && (c.as_str() == "v" || c.as_str() == "V")
                 && (self.modifiers.state().super_key()
                     || self.modifiers.state().control_key()) =>
@@ -403,9 +431,9 @@ impl ApplicationHandler for App {
                 match arboard::Clipboard::new().and_then(|mut cb| cb.get_text()) {
                     Ok(text) => {
                         self.setup_input.push_str(&text);
-                        println!("[setup] Pasted {} chars from clipboard", text.len());
+                        info!(target: "setup", "Pasted {} chars from clipboard", text.len());
                     }
-                    Err(e) => eprintln!("[setup] Clipboard read failed: {}", e),
+                    Err(e) => error!(target: "setup", "Clipboard read failed: {}", e),
                 }
             }
 
@@ -417,15 +445,15 @@ impl ApplicationHandler for App {
                         ..
                     },
                 ..
-            } if self.app_mode == AppMode::Setup => {
+            } if matches!(self.app_mode_machine.state(), AppModeState::Setup {}) => {
                 self.setup_input.push_str(c.as_str());
             }
 
             // ----------------------------------------------------------------
-            // Dashboard mode: voice input and hotkeys.
+            // Dashboard mode: voice and clipboard
             // ----------------------------------------------------------------
 
-            // Shift+Enter: start recording on press, stop on release.
+            // Shift+Enter: push-to-talk.
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -435,18 +463,20 @@ impl ApplicationHandler for App {
                         ..
                     },
                 ..
-            } if self.modifiers.state().shift_key() && self.app_mode == AppMode::Dashboard => {
+            } if self.modifiers.state().shift_key() && self.is_dashboard() => {
                 match state {
-                    ElementState::Pressed => self.start_recording(),
+                    ElementState::Pressed => {
+                        self.handle_voice_event(VoiceEvent::ShiftEnterPressed);
+                    }
                     ElementState::Released => {
-                        if self.recording.is_some() {
-                            self.stop_and_transcribe();
+                        if matches!(self.voice_machine.state(), VoiceState::Recording {}) {
+                            self.handle_voice_event(VoiceEvent::StopRecording);
                         }
                     }
                 }
             }
 
-            // 'V' key: toggle voice input on/off
+            // 'V' key: toggle voice.
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -455,17 +485,21 @@ impl ApplicationHandler for App {
                         ..
                     },
                 ..
-            } if (c.as_str() == "v" || c.as_str() == "V") && self.app_mode == AppMode::Dashboard => {
-                self.voice_config.enabled = !self.voice_config.enabled;
-                let status = if self.voice_config.enabled { "enabled" } else { "disabled" };
-                println!("[voice] Voice input {}", status);
-                if !self.voice_config.enabled {
-                    self.recording = None;
-                    self.voice_ui = VoiceUiState::Idle;
+            } if (c.as_str() == "v" || c.as_str() == "V")
+                && self.is_dashboard()
+                && !self.modifiers.state().super_key()
+                && !self.modifiers.state().control_key() =>
+            {
+                if self.voice_enabled() {
+                    self.handle_voice_event(VoiceEvent::Disable);
+                    info!(target: "voice", "Voice input disabled");
+                } else {
+                    self.handle_voice_event(VoiceEvent::Enable);
+                    info!(target: "voice", "Voice input enabled");
                 }
             }
 
-            // Press 'R' to request a fresh snapshot from all servers
+            // Cmd+C / Ctrl+C: copy selected text.
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -474,38 +508,86 @@ impl ApplicationHandler for App {
                         ..
                     },
                 ..
-            } if (c.as_str() == "r" || c.as_str() == "R") && self.app_mode == AppMode::Dashboard => {
-                // Could send request_snapshot to all connections
-                // For now, updates come automatically
+            } if (c.as_str() == "c" || c.as_str() == "C")
+                && (self.modifiers.state().super_key()
+                    || self.modifiers.state().control_key()) =>
+            {
+                self.copy_selection_to_clipboard();
             }
 
-            WindowEvent::Resized(size) => {
-                if let RenderState::Active {
-                    surface,
-                    valid_surface,
-                    ..
-                } = &mut self.state
-                {
-                    if size.width != 0 && size.height != 0 {
-                        self.context.resize_surface(surface, size.width, size.height);
-                        *valid_surface = true;
-                    } else {
-                        *valid_surface = false;
+            // 'R' key: reserved.
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        logical_key: Key::Character(ref c),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } if (c.as_str() == "r" || c.as_str() == "R") && self.is_dashboard() => {}
+
+            // ----------------------------------------------------------------
+            // Mouse: text selection
+            // ----------------------------------------------------------------
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor_pos = position;
+                if self.is_dashboard() {
+                    let x = position.x;
+                    let y = position.y;
+                    let parley_ctx = &mut self.parley_ctx;
+                    for region in &mut self.selectable_regions {
+                        region.handle_mouse_drag(x, y, parley_ctx);
                     }
                 }
             }
 
+            WindowEvent::MouseInput {
+                state: btn_state,
+                button: MouseButton::Left,
+                ..
+            } if self.is_dashboard() => {
+                let x = self.cursor_pos.x;
+                let y = self.cursor_pos.y;
+                match btn_state {
+                    ElementState::Pressed => {
+                        let parley_ctx = &mut self.parley_ctx;
+                        for region in &mut self.selectable_regions {
+                            if region.hit_test(x, y) {
+                                region.handle_mouse_press(x, y, parley_ctx);
+                            }
+                        }
+                    }
+                    ElementState::Released => {
+                        for region in &mut self.selectable_regions {
+                            region.handle_mouse_release();
+                        }
+                    }
+                }
+            }
+
+            // ----------------------------------------------------------------
+            // Render
+            // ----------------------------------------------------------------
             WindowEvent::RedrawRequested => {
-                // Poll for completed transcription results before borrowing surface.
                 self.poll_transcription();
 
-                // Render: borrow only the fields we need, avoiding a full &mut self borrow
-                // while the surface reference is live.
+                // Compute state snapshots before borrowing the render surface.
+                // Method calls require &self which conflicts with &mut self.render_state.
+                let voice_ui_state = VoiceMachine::ui_state(self.voice_machine.state());
+                let voice_enabled = !matches!(
+                    self.voice_machine.state(),
+                    VoiceState::Disabled {}
+                );
+                let is_setup = matches!(
+                    self.app_mode_machine.state(),
+                    AppModeState::Setup {}
+                );
+
                 let RenderState::Active {
                     surface,
                     valid_surface: true,
                     window,
-                } = &mut self.state
+                } = &mut self.render_state
                 else {
                     return;
                 };
@@ -516,7 +598,7 @@ impl ApplicationHandler for App {
                 let height = surface.config.height as f64;
                 let elapsed = self.start_time.elapsed().as_secs_f64();
 
-                if self.app_mode == AppMode::Setup {
+                if is_setup {
                     dashboard::render_setup_screen(
                         &mut self.scene,
                         width,
@@ -525,16 +607,31 @@ impl ApplicationHandler for App {
                         self.font_data.as_ref(),
                     );
                 } else {
+                    let instances = &self.app_mode_machine.inner().instances;
+
                     dashboard::render_dashboard(
                         &mut self.scene,
                         width,
                         height,
-                        &self.instances,
+                        instances,
                         elapsed,
                         self.font_data.as_ref(),
-                        &self.voice_ui,
-                        self.voice_config.enabled,
+                        &voice_ui_state,
+                        voice_enabled,
                     );
+
+                    // Render text selection overlays on top of dashboard.
+                    let selection_color = vello::peniko::Color::new([0.2_f32, 0.5, 1.0, 0.35]);
+                    let text_color = vello::peniko::Color::new([0.0_f32, 0.0, 0.0, 1.0]);
+                    let parley_ctx = &mut self.parley_ctx;
+                    for region in &mut self.selectable_regions {
+                        region.render_into_scene(
+                            &mut self.scene,
+                            text_color,
+                            selection_color,
+                            parley_ctx,
+                        );
+                    }
                 }
 
                 let device_handle = &self.context.devices[surface.dev_id];
@@ -590,7 +687,8 @@ impl ApplicationHandler for App {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Create the Tokio runtime for async WebSocket clients and transcription
+    let _log_guard = logging::init();
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -598,40 +696,33 @@ fn main() -> Result<()> {
 
     let rt_handle = runtime.handle().clone();
 
-    println!("bisque-computer v{}", env!("CARGO_PKG_VERSION"));
+    info!("bisque-computer v{}", env!("CARGO_PKG_VERSION"));
 
-    // Determine startup mode.
-    // If the user explicitly passed --endpoints, honour them and go straight to dashboard.
     let explicit_endpoints =
         args.endpoints.len() != 1 || args.endpoints[0] != "ws://localhost:9100";
 
-    let (app_mode, endpoints) = if explicit_endpoints {
-        let eps = args.endpoints.clone();
-        (AppMode::Dashboard, eps)
+    let (start_in_setup, endpoints) = if explicit_endpoints {
+        (false, args.endpoints.clone())
     } else if let Some(saved_url) = read_saved_server_url() {
-        println!("Using saved server URL: {}", saved_url);
-        (AppMode::Dashboard, vec![saved_url])
+        info!("Using saved server URL: {}", saved_url);
+        (false, vec![saved_url])
     } else {
-        println!("No server URL configured — starting setup screen.");
-        // Use a placeholder; no real connection is attempted until setup completes.
-        (AppMode::Setup, vec!["ws://setup-placeholder:9100".to_string()])
+        info!("No server URL configured — starting setup screen.");
+        (true, vec!["ws://setup-placeholder:9100".to_string()])
     };
 
-    if app_mode == AppMode::Dashboard {
-        println!("Connecting to {} endpoint(s):", endpoints.len());
+    if !start_in_setup {
+        info!("Connecting to {} endpoint(s):", endpoints.len());
         for ep in &endpoints {
-            println!("  - {}", ep);
+            info!("  - {}", ep);
         }
     }
 
-    // Voice config — derive whisper host before endpoints is consumed by spawn_clients.
-    let mut voice_config = VoiceConfig::default();
+    let mut voice_config = voice::VoiceConfig::default();
     if args.no_voice {
         voice_config.enabled = false;
     }
-    // The same server that hosts the Lobster dashboard also runs whisper.cpp,
-    // so extract the host from the WebSocket URL and route whisper calls there.
-    if app_mode == AppMode::Dashboard && !endpoints.is_empty() {
+    if !start_in_setup && !endpoints.is_empty() {
         if let Ok(parsed) = url::Url::parse(&endpoints[0]) {
             if let Some(h) = parsed.host_str() {
                 voice_config.whisper_host = h.to_string();
@@ -639,56 +730,68 @@ fn main() -> Result<()> {
         }
     }
 
-    // Spawn WebSocket client tasks (consumes `endpoints`)
     let (instances, outbound) = ws_client::spawn_clients(&runtime, endpoints);
 
-    // Load fonts at startup
     let font_data = dashboard::load_readable_font();
     let mono_font_data = dashboard::load_mono_font();
 
     if font_data.is_some() {
-        println!("Loaded readable font (Optima/Helvetica/DejaVu Sans)");
+        info!("Loaded readable font (Optima/Helvetica/DejaVu Sans)");
     } else {
-        eprintln!("Note: No system font found (Optima/Helvetica/DejaVu Sans).");
-        eprintln!("All text will use bitmap font fallback.");
-    }
-    if mono_font_data.is_some() {
-        println!("Loaded monospace font (Monaco/Menlo/DejaVu Sans Mono)");
-    } else {
-        eprintln!("Note: No monospace font found (Monaco/Menlo/DejaVu Sans Mono).");
+        warn!("No system font found — using bitmap fallback");
     }
 
     if voice_config.enabled {
-        println!("Voice input: enabled (Shift+Enter to record, V to toggle)");
-        println!("  whisper host:  {}", voice_config.whisper_host);
-        println!("  whisper port:  {}", voice_config.whisper_port);
+        info!(
+            whisper_host = %voice_config.whisper_host,
+            whisper_port = voice_config.whisper_port,
+            "Voice input: enabled (Shift+Enter to record, V to toggle)"
+        );
     } else {
-        println!("Voice input: disabled (--no-voice flag set)");
+        info!("Voice input: disabled (--no-voice flag set)");
     }
 
-    // Sync channel for transcription results (async task → main event loop)
-    let (transcription_tx, transcription_rx) =
-        std::sync::mpsc::sync_channel::<Result<voice::TranscriptionResult, String>>(4);
+    // Build voice state machine.
+    let voice_sm_base = VoiceMachine::new(voice_config.clone(), rt_handle, outbound.clone());
+    let voice_machine = if !voice_config.enabled {
+        let mut sm = voice_sm_base.uninitialized_state_machine();
+        *sm.state_mut() = VoiceState::Disabled {};
+        let initialized = sm.init();
+        initialized.into()
+    } else {
+        let mut sm = voice_sm_base.state_machine();
+        sm.init();
+        sm
+    };
+
+    // Build app-mode state machine.
+    let app_mode_base = AppModeMachine::new(instances.clone(), outbound.clone());
+    let app_mode_machine = if start_in_setup {
+        let mut sm = app_mode_base.state_machine();
+        sm.init();
+        sm
+    } else {
+        let mut sm = app_mode_base.uninitialized_state_machine();
+        *sm.state_mut() = AppModeState::Dashboard {};
+        let initialized = sm.init();
+        initialized.into()
+    };
 
     let mut app = App {
         context: RenderContext::new(),
         renderers: vec![],
-        state: RenderState::Suspended(None),
+        render_state: RenderState::Suspended(None),
         scene: Scene::new(),
         start_time: Instant::now(),
-        instances,
-        outbound,
         windowed: args.windowed,
         font_data,
         mono_font_data,
-        voice_config,
+        voice_machine,
+        app_mode_machine,
         modifiers: Modifiers::default(),
-        recording: None,
-        voice_ui: VoiceUiState::Idle,
-        rt_handle,
-        transcription_rx,
-        transcription_tx,
-        app_mode,
+        cursor_pos: PhysicalPosition::default(),
+        parley_ctx: ParleyCtx::new(),
+        selectable_regions: Vec::new(),
         setup_input: String::new(),
     };
 
@@ -697,7 +800,6 @@ fn main() -> Result<()> {
         .run_app(&mut app)
         .expect("Couldn't run event loop");
 
-    // Clean shutdown of the Tokio runtime
     runtime.shutdown_timeout(std::time::Duration::from_secs(1));
 
     Ok(())
