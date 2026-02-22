@@ -11,6 +11,7 @@
 //! the connection URL. The URL is saved to `~/.config/bisque-computer/server`.
 
 mod dashboard;
+mod logging;
 #[allow(dead_code)]
 mod protocol;
 mod voice;
@@ -18,6 +19,7 @@ mod ws_client;
 
 use anyhow::Result;
 use clap::Parser;
+use tracing::{error, info, warn};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -187,10 +189,10 @@ impl App {
             Ok(rec) => {
                 self.recording = Some(rec);
                 self.voice_ui = VoiceUiState::Recording;
-                println!("[voice] Recording started");
+                info!(target: "voice", "Recording started");
             }
             Err(e) => {
-                eprintln!("[voice] Failed to start recording: {}", e);
+                error!(target: "voice", "Failed to start recording: {}", e);
                 self.voice_ui = VoiceUiState::Error(e.to_string());
             }
         }
@@ -204,7 +206,7 @@ impl App {
         };
 
         self.voice_ui = VoiceUiState::Transcribing;
-        println!("[voice] Recording stopped, transcribing...");
+        info!(target: "voice", "Recording stopped, transcribing...");
 
         let samples = voice::stop_and_collect(&rec);
         let sample_rate = rec.sample_rate;
@@ -232,7 +234,7 @@ impl App {
         match self.transcription_rx.try_recv() {
             Ok(Ok(result)) => {
                 let text = result.text.clone();
-                println!("[voice] Transcribed: {:?}", text);
+                info!(target: "voice", "Transcribed: {:?}", text);
 
                 if !text.is_empty() {
                     let msg = protocol::VoiceInputMessage::new(text.clone());
@@ -242,7 +244,7 @@ impl App {
                 self.voice_ui = VoiceUiState::Done(text);
             }
             Ok(Err(e)) => {
-                eprintln!("[voice] Transcription failed: {}", e);
+                error!(target: "voice", "Transcription failed: {}", e);
                 self.voice_ui = VoiceUiState::Error(e);
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
@@ -358,12 +360,12 @@ impl ApplicationHandler for App {
                 if url.starts_with("ws://") || url.starts_with("wss://") {
                     match save_server_url(&url) {
                         Ok(()) => {
-                            println!("[setup] Saved server URL: {}", url);
+                            info!(target: "setup", "Saved server URL: {}", url);
                             // Extract whisper host from the WebSocket URL host.
                             if let Ok(parsed) = url::Url::parse(&url) {
                                 if let Some(h) = parsed.host_str() {
                                     self.voice_config.whisper_host = h.to_string();
-                                    println!("[setup] whisper host set to: {}", h);
+                                    info!(target: "setup", "whisper host set to: {}", h);
                                 }
                             }
                             // Spawn a fresh WebSocket client for the saved URL.
@@ -379,10 +381,10 @@ impl ApplicationHandler for App {
                             self.outbound = outbound;
                             self.app_mode = AppMode::Dashboard;
                         }
-                        Err(e) => eprintln!("[setup] Failed to save server URL: {}", e),
+                        Err(e) => error!(target: "setup", "Failed to save server URL: {}", e),
                     }
                 } else {
-                    eprintln!("[setup] URL must start with ws:// or wss://");
+                    warn!(target: "setup", "URL must start with ws:// or wss://");
                 }
             }
 
@@ -403,9 +405,9 @@ impl ApplicationHandler for App {
                 match arboard::Clipboard::new().and_then(|mut cb| cb.get_text()) {
                     Ok(text) => {
                         self.setup_input.push_str(&text);
-                        println!("[setup] Pasted {} chars from clipboard", text.len());
+                        info!(target: "setup", "Pasted {} chars from clipboard", text.len());
                     }
-                    Err(e) => eprintln!("[setup] Clipboard read failed: {}", e),
+                    Err(e) => error!(target: "setup", "Clipboard read failed: {}", e),
                 }
             }
 
@@ -458,7 +460,7 @@ impl ApplicationHandler for App {
             } if (c.as_str() == "v" || c.as_str() == "V") && self.app_mode == AppMode::Dashboard => {
                 self.voice_config.enabled = !self.voice_config.enabled;
                 let status = if self.voice_config.enabled { "enabled" } else { "disabled" };
-                println!("[voice] Voice input {}", status);
+                info!(target: "voice", "Voice input {}", status);
                 if !self.voice_config.enabled {
                     self.recording = None;
                     self.voice_ui = VoiceUiState::Idle;
@@ -590,6 +592,10 @@ impl ApplicationHandler for App {
 fn main() -> Result<()> {
     let args = Args::parse();
 
+    // Initialise file logging if BISQUE_LOG is set. The guard must remain
+    // alive for the entire process lifetime — dropping it flushes the file.
+    let _log_guard = logging::init();
+
     // Create the Tokio runtime for async WebSocket clients and transcription
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -598,7 +604,7 @@ fn main() -> Result<()> {
 
     let rt_handle = runtime.handle().clone();
 
-    println!("bisque-computer v{}", env!("CARGO_PKG_VERSION"));
+    info!("bisque-computer v{}", env!("CARGO_PKG_VERSION"));
 
     // Determine startup mode.
     // If the user explicitly passed --endpoints, honour them and go straight to dashboard.
@@ -609,18 +615,18 @@ fn main() -> Result<()> {
         let eps = args.endpoints.clone();
         (AppMode::Dashboard, eps)
     } else if let Some(saved_url) = read_saved_server_url() {
-        println!("Using saved server URL: {}", saved_url);
+        info!("Using saved server URL: {}", saved_url);
         (AppMode::Dashboard, vec![saved_url])
     } else {
-        println!("No server URL configured — starting setup screen.");
+        info!("No server URL configured — starting setup screen.");
         // Use a placeholder; no real connection is attempted until setup completes.
         (AppMode::Setup, vec!["ws://setup-placeholder:9100".to_string()])
     };
 
     if app_mode == AppMode::Dashboard {
-        println!("Connecting to {} endpoint(s):", endpoints.len());
+        info!("Connecting to {} endpoint(s):", endpoints.len());
         for ep in &endpoints {
-            println!("  - {}", ep);
+            info!("  - {}", ep);
         }
     }
 
@@ -647,23 +653,24 @@ fn main() -> Result<()> {
     let mono_font_data = dashboard::load_mono_font();
 
     if font_data.is_some() {
-        println!("Loaded readable font (Optima/Helvetica/DejaVu Sans)");
+        info!("Loaded readable font (Optima/Helvetica/DejaVu Sans)");
     } else {
-        eprintln!("Note: No system font found (Optima/Helvetica/DejaVu Sans).");
-        eprintln!("All text will use bitmap font fallback.");
+        warn!("No system font found (Optima/Helvetica/DejaVu Sans) — using bitmap fallback");
     }
     if mono_font_data.is_some() {
-        println!("Loaded monospace font (Monaco/Menlo/DejaVu Sans Mono)");
+        info!("Loaded monospace font (Monaco/Menlo/DejaVu Sans Mono)");
     } else {
-        eprintln!("Note: No monospace font found (Monaco/Menlo/DejaVu Sans Mono).");
+        warn!("No monospace font found (Monaco/Menlo/DejaVu Sans Mono)");
     }
 
     if voice_config.enabled {
-        println!("Voice input: enabled (Shift+Enter to record, V to toggle)");
-        println!("  whisper host:  {}", voice_config.whisper_host);
-        println!("  whisper port:  {}", voice_config.whisper_port);
+        info!(
+            whisper_host = %voice_config.whisper_host,
+            whisper_port = voice_config.whisper_port,
+            "Voice input: enabled (Shift+Enter to record, V to toggle)"
+        );
     } else {
-        println!("Voice input: disabled (--no-voice flag set)");
+        info!("Voice input: disabled (--no-voice flag set)");
     }
 
     // Sync channel for transcription results (async task → main event loop)

@@ -13,6 +13,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
+use tracing::{error, info, warn};
 
 use crate::protocol::{ConnectionStatus, DashboardState, Frame, LobsterInstance};
 
@@ -102,6 +103,7 @@ async fn client_loop(
                         inst.status = ConnectionStatus::Connected;
                     }
                 }
+                info!(target: "ws_client", url = %url, "WebSocket connected");
 
                 let (mut write, mut read) = ws_stream.split();
 
@@ -116,8 +118,12 @@ async fn client_loop(
                                 Some(Ok(Message::Ping(data))) => {
                                     let _ = write.send(Message::Pong(data)).await;
                                 }
-                                Some(Ok(Message::Close(_))) | None => break,
+                                Some(Ok(Message::Close(_))) | None => {
+                                    info!(target: "ws_client", url = %url, "WebSocket closed by server");
+                                    break;
+                                }
                                 Some(Err(e)) => {
+                                    error!(target: "ws_client", url = %url, "WebSocket error: {}", e);
                                     let mut instances = shared.lock().unwrap();
                                     if let Some(inst) = instances.get_mut(index) {
                                         inst.status =
@@ -133,7 +139,7 @@ async fn client_loop(
                         Some(json) = outbound_rx.recv() => {
                             let msg = Message::Text(json.into());
                             if let Err(e) = write.send(msg).await {
-                                eprintln!("Failed to send outbound message: {}", e);
+                                error!(target: "ws_client", "Failed to send outbound message: {}", e);
                                 break;
                             }
                         }
@@ -151,6 +157,7 @@ async fn client_loop(
                 }
             }
             Err(e) => {
+                warn!(target: "ws_client", url = %url, "Connection failed: {} — retrying in 3s", e);
                 let mut instances = shared.lock().unwrap();
                 if let Some(inst) = instances.get_mut(index) {
                     inst.status = ConnectionStatus::Error(format!("Connect failed: {}", e));

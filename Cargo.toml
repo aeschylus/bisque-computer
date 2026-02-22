@@ -24,6 +24,11 @@ serde_json = "1"
 # Time handling
 chrono = { version = "0.4", features = ["serde"] }
 
+# Structured logging (dev file logging via BISQUE_LOG=1)
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "ansi"] }
+tracing-appender = "0.2"
+
 # CLI argument parsing
 clap = { version = "4", features = ["derive"] }
 

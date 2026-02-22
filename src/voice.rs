@@ -12,6 +12,7 @@ use cpal::{SampleFormat, SampleRate, StreamConfig};
 use std::io::Cursor;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use tracing::{error, warn};
 
 /// Configuration for the voice input subsystem.
 #[derive(Debug, Clone)]
@@ -138,7 +139,7 @@ fn build_f32_stream(
                 }
             }
         },
-        |err| eprintln!("Audio stream error: {}", err),
+        |err| error!(target: "voice", "Audio stream error: {}", err),
         None,
     )?;
     Ok(stream)
@@ -159,7 +160,7 @@ fn build_i16_stream(
                 }
             }
         },
-        |err| eprintln!("Audio stream error: {}", err),
+        |err| error!(target: "voice", "Audio stream error: {}", err),
         None,
     )?;
     Ok(stream)
@@ -183,7 +184,7 @@ fn build_u16_stream(
                 }
             }
         },
-        |err| eprintln!("Audio stream error: {}", err),
+        |err| error!(target: "voice", "Audio stream error: {}", err),
         None,
     )?;
     Ok(stream)
@@ -399,7 +400,8 @@ pub async fn transcribe(wav_bytes: Vec<u8>, config: &VoiceConfig) -> Result<Tran
     match transcribe_via_server(wav_bytes.clone(), &config.whisper_host, config.whisper_port).await {
         Ok(result) => Ok(result),
         Err(server_err) => {
-            eprintln!(
+            warn!(
+                target: "voice",
                 "whisper HTTP server unavailable ({}), falling back to CLI",
                 server_err
             );
