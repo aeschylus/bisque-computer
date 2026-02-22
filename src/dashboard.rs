@@ -482,6 +482,128 @@ fn draw_instance_panel(
         let bot_status = if health.telegram_bot_running { "running" } else { "stopped" };
         let bot_color = if health.telegram_bot_running { ACCENT_GREEN } else { ACCENT_RED };
         draw_label_value_colored_with_font(scene, inner_x, cursor_y, "Telegram Bot", bot_status, inner_w, bot_color, font_data);
+        cursor_y += LINE_HEIGHT;
+    }
+
+    // --- Agents section ---
+    if cursor_y + 40.0 < y + h {
+        cursor_y = draw_section_header_with_font(scene, inner_x, cursor_y, inner_w, "AGENTS", font_data);
+
+        let agents = &state.subagent_list.agents;
+        if agents.is_empty() {
+            draw_text_with_font(scene, inner_x + 4.0, cursor_y + 24.0, "No agents running", TEXT_SECONDARY, 22.0, font_data);
+            cursor_y += LINE_HEIGHT;
+        } else {
+            for agent in agents.iter().take(4) {
+                if cursor_y + LINE_HEIGHT > y + h {
+                    break;
+                }
+                // Status dot
+                let dot_color = match agent.status.as_str() {
+                    "running" => ACCENT_GREEN,
+                    "stale" => ACCENT_AMBER,
+                    _ => TEXT_SECONDARY,
+                };
+                draw_circle(scene, inner_x + STATUS_DOT_RADIUS, cursor_y + 18.0, STATUS_DOT_RADIUS * 0.75, dot_color);
+
+                // Description (truncated)
+                let desc = if agent.description.len() > 52 {
+                    format!("{}...", &agent.description[..52])
+                } else {
+                    agent.description.clone()
+                };
+                draw_text_with_font(scene, inner_x + 20.0, cursor_y + 24.0, &desc, TEXT_PRIMARY, 20.0, font_data);
+
+                // Elapsed time and stats on the right
+                let elapsed_str = match agent.elapsed_seconds {
+                    Some(s) if s < 60 => format!("{}s", s),
+                    Some(s) if s < 3600 => format!("{}m", s / 60),
+                    Some(s) => format!("{}h{}m", s / 3600, (s % 3600) / 60),
+                    None => "?".to_string(),
+                };
+                let turns_str = agent.runtime.as_ref().map_or("".to_string(), |r| {
+                    format!("{} turns/{} tools", r.turns, r.tool_uses)
+                });
+                let stats_str = if turns_str.is_empty() {
+                    elapsed_str
+                } else {
+                    format!("{} | {}", elapsed_str, turns_str)
+                };
+                let stats_w = stats_str.len() as f64 * 12.0;
+                draw_text_with_font(scene, (inner_x + inner_w - stats_w).max(inner_x + 20.0), cursor_y + 24.0, &stats_str, TEXT_SECONDARY, 20.0, font_data);
+                cursor_y += LINE_HEIGHT;
+            }
+            if agents.len() > 4 {
+                draw_text_with_font(scene, inner_x + 8.0, cursor_y + 24.0, &format!("  +{} more", agents.len() - 4), TEXT_SECONDARY, 20.0, font_data);
+                cursor_y += LINE_HEIGHT;
+            }
+        }
+        cursor_y += 4.0;
+    }
+
+    // --- Memory section ---
+    if cursor_y + 40.0 < y + h {
+        cursor_y = draw_section_header_with_font(scene, inner_x, cursor_y, inner_w, "MEMORY", font_data);
+
+        let mem = &state.memory;
+
+        // Summary line
+        let summary = format!(
+            "{} events, {} unconsolidated",
+            mem.total_events, mem.unconsolidated_count
+        );
+        draw_label_value_with_font(scene, inner_x, cursor_y, "Events", &mem.total_events.to_string(), inner_w, font_data);
+        let _ = summary; // used for readability above
+        cursor_y += LINE_HEIGHT;
+
+        // Projects list
+        if !mem.projects.is_empty() && cursor_y + LINE_HEIGHT < y + h {
+            let projects_str = if mem.projects.len() > 4 {
+                format!("{} (+{})", mem.projects[..4].join(", "), mem.projects.len() - 4)
+            } else {
+                mem.projects.join(", ")
+            };
+            draw_label_value_with_font(scene, inner_x, cursor_y, "Projects", &projects_str, inner_w, font_data);
+            cursor_y += LINE_HEIGHT;
+        }
+
+        // Recent events (up to 4)
+        for event in mem.recent_events.iter().take(4) {
+            if cursor_y + LINE_HEIGHT > y + h {
+                break;
+            }
+            let type_tag = match event.event_type.as_str() {
+                "decision" => "[D]",
+                "note" => "[N]",
+                "link" => "[L]",
+                "task" => "[T]",
+                _ => "[?]",
+            };
+            let content_max = 50usize;
+            let snippet = if event.content.len() > content_max {
+                format!("{}...", &event.content[..content_max])
+            } else {
+                event.content.clone()
+            };
+            let line = format!("{} {}", type_tag, snippet);
+            draw_text_with_font(scene, inner_x + 4.0, cursor_y + 22.0, &line, TEXT_SECONDARY, 20.0, font_data);
+            cursor_y += LINE_HEIGHT;
+        }
+
+        // Last consolidation
+        if cursor_y + LINE_HEIGHT < y + h {
+            let consol_str = match &mem.consolidations.last_consolidation_at {
+                Some(ts) => {
+                    // Show just date+time portion for brevity (first 16 chars of ISO)
+                    let short = if ts.len() > 16 { &ts[..16] } else { ts.as_str() };
+                    format!("Last: {}", short)
+                }
+                None => "Last: never".to_string(),
+            };
+            draw_text_with_font(scene, inner_x + 4.0, cursor_y + 22.0, &consol_str, TEXT_SECONDARY, 20.0, font_data);
+            cursor_y += LINE_HEIGHT;
+        }
+        let _ = cursor_y;
     }
 }
 

@@ -6,6 +6,8 @@
 //!
 //! Also defines outbound message types sent from bisque-computer to the server.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 /// Top-level message frame from the server.
@@ -33,8 +35,13 @@ pub struct DashboardState {
     pub scheduled_jobs: Vec<ScheduledJob>,
     #[serde(default)]
     pub task_outputs: Vec<serde_json::Value>,
+    /// Legacy field — kept for backward-compatibility. New field is `memory`.
     #[serde(default)]
     pub recent_memory: Vec<MemoryEvent>,
+    #[serde(default)]
+    pub subagent_list: SubagentList,
+    #[serde(default)]
+    pub memory: MemoryStats,
     #[serde(default)]
     pub conversation_activity: ConversationActivity,
     #[serde(default)]
@@ -201,7 +208,102 @@ pub struct MemoryEvent {
     #[serde(default)]
     pub content: String,
     #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
     pub consolidated: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Subagent types
+// ---------------------------------------------------------------------------
+
+/// Runtime statistics parsed from a JSONL task output file.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct AgentRuntime {
+    #[serde(default)]
+    pub agent_id: String,
+    #[serde(default)]
+    pub turns: u64,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub tool_uses: u64,
+    #[serde(default)]
+    pub top_tools: HashMap<String, u64>,
+    pub last_activity_seconds_ago: Option<u64>,
+    #[serde(default)]
+    pub stale: bool,
+    pub first_timestamp: Option<String>,
+    pub last_timestamp: Option<String>,
+}
+
+/// A single pending Lobster agent with optional runtime stats.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct SubagentInfo {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub description: String,
+    pub chat_id: Option<i64>,
+    pub started_at: Option<String>,
+    pub elapsed_seconds: Option<u64>,
+    #[serde(default)]
+    pub status: String,
+    pub runtime: Option<AgentRuntime>,
+}
+
+/// The full subagent list payload from `collect_subagent_list`.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct SubagentList {
+    #[serde(default)]
+    pub pending_count: u64,
+    #[serde(default)]
+    pub agents: Vec<SubagentInfo>,
+    #[serde(default)]
+    pub running_tasks: Vec<serde_json::Value>,
+}
+
+// ---------------------------------------------------------------------------
+// Memory stats types
+// ---------------------------------------------------------------------------
+
+/// A canonical memory file (a .md file in memory/canonical/).
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct CanonicalFile {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub path: String,
+    pub modified: Option<String>,
+    #[serde(default)]
+    pub size_bytes: u64,
+}
+
+/// Consolidation metadata: last run time and list of canonical files.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct MemoryConsolidations {
+    pub last_consolidation_at: Option<String>,
+    #[serde(default)]
+    pub canonical_files: Vec<CanonicalFile>,
+}
+
+/// Full memory statistics from `collect_memory_stats`.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct MemoryStats {
+    #[serde(default)]
+    pub total_events: u64,
+    #[serde(default)]
+    pub unconsolidated_count: u64,
+    #[serde(default)]
+    pub event_type_counts: HashMap<String, u64>,
+    #[serde(default)]
+    pub projects: Vec<String>,
+    #[serde(default)]
+    pub recent_events: Vec<MemoryEvent>,
+    #[serde(default)]
+    pub consolidations: MemoryConsolidations,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
