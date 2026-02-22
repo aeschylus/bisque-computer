@@ -9,8 +9,8 @@ winit = "0.30.12"
 pollster = "0.4.0"
 anyhow = "1.0"
 
-# Async runtime for WebSocket client
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+# Async runtime for WebSocket client and process spawning
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "fs"] }
 
 # WebSocket client
 tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "handshake"] }
@@ -30,3 +30,8 @@ clap = { version = "4", features = ["derive"] }
 # Font rendering
 skrifa = "0.40.0"
 peniko = "0.6.0"
+
+# Voice input: audio capture, WAV encoding, HTTP transcription
+cpal = "0.15"
+hound = "3.5"
+reqwest = { version = "0.12", features = ["multipart", "json"] }
