@@ -1018,6 +1018,86 @@ fn load_system_font(font_names: &[&str]) -> Option<FontData> {
     None
 }
 
+/// Render the first-run setup screen.
+///
+/// Shown when `~/.config/bisque-computer/server` is absent. The user types a
+/// WebSocket URL then presses Enter to save and connect.
+pub fn render_setup_screen(
+    scene: &mut Scene,
+    width: f64,
+    height: f64,
+    input_buffer: &str,
+    font_data: Option<&FontData>,
+) {
+    // Full bisque background
+    let bg = Rect::new(0.0, 0.0, width, height);
+    scene.fill(Fill::NonZero, Affine::IDENTITY, BG_COLOR, None, &bg);
+
+    let cx = width / 2.0;
+    let cy = height / 2.0;
+
+    // Title: "Connect to Lobster"
+    let title = "Connect to Lobster";
+    let title_size = 52.0_f64;
+    let title_w = title.len() as f64 * title_size * 0.55;
+    draw_text_with_font(scene, cx - title_w / 2.0, cy - 120.0, title, TEXT_PRIMARY, title_size, font_data);
+
+    // Instruction
+    let instr = "Enter your Lobster connection URL and press Enter";
+    let instr_size = 26.0_f64;
+    let instr_w = instr.len() as f64 * instr_size * 0.55;
+    draw_text_with_font(scene, cx - instr_w / 2.0, cy - 60.0, instr, TEXT_SECONDARY, instr_size, font_data);
+
+    // Hint
+    let hint = "(e.g. ws://IP:9100?token=UUID)";
+    let hint_size = 22.0_f64;
+    let hint_w = hint.len() as f64 * hint_size * 0.55;
+    draw_text_with_font(scene, cx - hint_w / 2.0, cy - 28.0, hint, TEXT_SECONDARY, hint_size, font_data);
+
+    // Input field
+    let field_w = (width * 0.7).min(900.0);
+    let field_h = 56.0;
+    let field_x = cx - field_w / 2.0;
+    let field_y = cy + 8.0;
+    let field_rect = RoundedRect::new(field_x, field_y, field_x + field_w, field_y + field_h, 6.0);
+
+    // White-ish fill for the input area
+    let field_fill = Color::new([1.0_f32, 1.0, 1.0, 0.85]);
+    scene.fill(Fill::NonZero, Affine::IDENTITY, field_fill, None, &field_rect);
+    // Border
+    scene.stroke(
+        &vello::kurbo::Stroke::new(2.0),
+        Affine::IDENTITY,
+        PANEL_BORDER,
+        None,
+        &field_rect,
+    );
+
+    // Text inside the field
+    let (display_text, text_color) = if input_buffer.is_empty() {
+        ("ws://".to_string(), TEXT_SECONDARY)
+    } else {
+        (input_buffer.to_string(), TEXT_PRIMARY)
+    };
+    draw_text_with_font(scene, field_x + 14.0, field_y + 38.0, &display_text, text_color, 28.0, font_data);
+
+    // Cursor
+    let char_advance = 16.0_f64;
+    let cursor_x = if input_buffer.is_empty() {
+        field_x + 14.0 + 5.0 * char_advance // after "ws://"
+    } else {
+        field_x + 14.0 + input_buffer.len() as f64 * char_advance
+    };
+    let cursor_rect = Rect::new(cursor_x, field_y + 12.0, cursor_x + 2.0, field_y + field_h - 12.0);
+    scene.fill(Fill::NonZero, Affine::IDENTITY, TEXT_PRIMARY, None, &cursor_rect);
+
+    // Footer
+    let footer = "Press Enter to connect  |  Press Escape to quit";
+    let footer_size = 22.0_f64;
+    let footer_w = footer.len() as f64 * footer_size * 0.55;
+    draw_text_with_font(scene, cx - footer_w / 2.0, cy + 120.0, footer, TEXT_SECONDARY, footer_size, font_data);
+}
+
 /// Load the best available font for readable text.
 /// Font stack: Optima > Helvetica > Arial > DejaVu Sans > Liberation Sans
 pub fn load_readable_font() -> Option<FontData> {

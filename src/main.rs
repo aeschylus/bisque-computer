@@ -6,6 +6,9 @@
 //! Uses vello/wgpu for rendering and tokio-tungstenite for WebSocket communication.
 //! Voice input (Shift+Enter push-to-talk) transcribes audio via whisper.cpp and
 //! sends the result as a voice_input message over the existing WebSocket connection.
+//!
+//! On first launch (no config file), shows a setup screen where the user enters
+//! the connection URL. The URL is saved to `~/.config/bisque-computer/server`.
 
 mod dashboard;
 #[allow(dead_code)]
@@ -15,6 +18,7 @@ mod ws_client;
 
 use anyhow::Result;
 use clap::Parser;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use vello::peniko::color::palette;
@@ -31,6 +35,81 @@ use vello::wgpu;
 
 use voice::{VoiceConfig, VoiceUiState};
 use ws_client::{OutboundSender, SharedInstances};
+
+// ---------------------------------------------------------------------------
+// Config file helpers
+// ---------------------------------------------------------------------------
+
+/// Path to the server URL config file: `~/.config/bisque-computer/server`.
+fn config_file_path() -> PathBuf {
+    let mut p = config_base_dir();
+    p.push("bisque-computer");
+    p.push("server");
+    p
+}
+
+/// Return the OS-appropriate config base directory.
+fn config_base_dir() -> PathBuf {
+    // Respect XDG_CONFIG_HOME if set (Linux/CI)
+    if let Ok(val) = std::env::var("XDG_CONFIG_HOME") {
+        return PathBuf::from(val);
+    }
+    // macOS: ~/Library/Application Support
+    #[cfg(target_os = "macos")]
+    {
+        let mut p = home_dir();
+        p.push("Library");
+        p.push("Application Support");
+        return p;
+    }
+    // Linux and others: ~/.config
+    #[allow(unreachable_code)]
+    {
+        let mut p = home_dir();
+        p.push(".config");
+        p
+    }
+}
+
+fn home_dir() -> PathBuf {
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp"))
+}
+
+/// Read the saved server URL from `~/.config/bisque-computer/server`.
+/// Returns `None` when the file is absent or empty.
+fn read_saved_server_url() -> Option<String> {
+    let path = config_file_path();
+    if !path.exists() {
+        return None;
+    }
+    let url = std::fs::read_to_string(&path).ok()?.trim().to_string();
+    if url.is_empty() { None } else { Some(url) }
+}
+
+/// Persist `url` to `~/.config/bisque-computer/server`, creating dirs as needed.
+fn save_server_url(url: &str) -> Result<()> {
+    let path = config_file_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, url)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Application mode
+// ---------------------------------------------------------------------------
+
+/// Determines which screen is currently active.
+#[derive(Debug, PartialEq, Eq)]
+enum AppMode {
+    /// Normal dashboard: connected (or connecting) to a Lobster server.
+    Dashboard,
+    /// First-run setup: waiting for the user to paste a connection URL.
+    Setup,
+}
 
 /// Lobster Instance Dashboard
 #[derive(Parser, Debug)]
@@ -87,6 +166,12 @@ struct App {
     /// Channel for receiving transcription results from the async task.
     transcription_rx: std::sync::mpsc::Receiver<Result<voice::TranscriptionResult, String>>,
     transcription_tx: std::sync::mpsc::SyncSender<Result<voice::TranscriptionResult, String>>,
+
+    // --- Setup mode state ---
+    /// Current application mode.
+    app_mode: AppMode,
+    /// Characters typed in the setup URL field.
+    setup_input: String,
 }
 
 impl App {
@@ -244,6 +329,72 @@ impl ApplicationHandler for App {
                 ..
             } => event_loop.exit(),
 
+            // ----------------------------------------------------------------
+            // Setup mode: capture keyboard input for the URL field.
+            // ----------------------------------------------------------------
+
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        logical_key: Key::Named(NamedKey::Backspace),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } if self.app_mode == AppMode::Setup => {
+                self.setup_input.pop();
+            }
+
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        logical_key: Key::Named(NamedKey::Enter),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } if self.app_mode == AppMode::Setup => {
+                let url = self.setup_input.trim().to_string();
+                if url.starts_with("ws://") || url.starts_with("wss://") {
+                    match save_server_url(&url) {
+                        Ok(()) => {
+                            println!("[setup] Saved server URL: {}", url);
+                            // Spawn a fresh WebSocket client for the saved URL.
+                            let rt = tokio::runtime::Builder::new_multi_thread()
+                                .enable_all()
+                                .build()
+                                .expect("Failed to create runtime for setup");
+                            let (instances, outbound) =
+                                ws_client::spawn_clients(&rt, vec![url.clone()]);
+                            // Leak the runtime so the spawned tasks keep running.
+                            std::mem::forget(rt);
+                            self.instances = instances;
+                            self.outbound = outbound;
+                            self.app_mode = AppMode::Dashboard;
+                        }
+                        Err(e) => eprintln!("[setup] Failed to save server URL: {}", e),
+                    }
+                } else {
+                    eprintln!("[setup] URL must start with ws:// or wss://");
+                }
+            }
+
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        logical_key: Key::Character(ref c),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } if self.app_mode == AppMode::Setup => {
+                self.setup_input.push_str(c.as_str());
+            }
+
+            // ----------------------------------------------------------------
+            // Dashboard mode: voice input and hotkeys.
+            // ----------------------------------------------------------------
+
             // Shift+Enter: start recording on press, stop on release.
             WindowEvent::KeyboardInput {
                 event:
@@ -254,14 +405,16 @@ impl ApplicationHandler for App {
                         ..
                     },
                 ..
-            } if self.modifiers.state().shift_key() => match state {
-                ElementState::Pressed => self.start_recording(),
-                ElementState::Released => {
-                    if self.recording.is_some() {
-                        self.stop_and_transcribe();
+            } if self.modifiers.state().shift_key() && self.app_mode == AppMode::Dashboard => {
+                match state {
+                    ElementState::Pressed => self.start_recording(),
+                    ElementState::Released => {
+                        if self.recording.is_some() {
+                            self.stop_and_transcribe();
+                        }
                     }
                 }
-            },
+            }
 
             // 'V' key: toggle voice input on/off
             WindowEvent::KeyboardInput {
@@ -272,7 +425,7 @@ impl ApplicationHandler for App {
                         ..
                     },
                 ..
-            } if c.as_str() == "v" || c.as_str() == "V" => {
+            } if (c.as_str() == "v" || c.as_str() == "V") && self.app_mode == AppMode::Dashboard => {
                 self.voice_config.enabled = !self.voice_config.enabled;
                 let status = if self.voice_config.enabled { "enabled" } else { "disabled" };
                 println!("[voice] Voice input {}", status);
@@ -291,7 +444,7 @@ impl ApplicationHandler for App {
                         ..
                     },
                 ..
-            } if c.as_str() == "r" || c.as_str() == "R" => {
+            } if (c.as_str() == "r" || c.as_str() == "R") && self.app_mode == AppMode::Dashboard => {
                 // Could send request_snapshot to all connections
                 // For now, updates come automatically
             }
@@ -333,16 +486,26 @@ impl ApplicationHandler for App {
                 let height = surface.config.height as f64;
                 let elapsed = self.start_time.elapsed().as_secs_f64();
 
-                dashboard::render_dashboard(
-                    &mut self.scene,
-                    width,
-                    height,
-                    &self.instances,
-                    elapsed,
-                    self.font_data.as_ref(),
-                    &self.voice_ui,
-                    self.voice_config.enabled,
-                );
+                if self.app_mode == AppMode::Setup {
+                    dashboard::render_setup_screen(
+                        &mut self.scene,
+                        width,
+                        height,
+                        &self.setup_input,
+                        self.font_data.as_ref(),
+                    );
+                } else {
+                    dashboard::render_dashboard(
+                        &mut self.scene,
+                        width,
+                        height,
+                        &self.instances,
+                        elapsed,
+                        self.font_data.as_ref(),
+                        &self.voice_ui,
+                        self.voice_config.enabled,
+                    );
+                }
 
                 let device_handle = &self.context.devices[surface.dev_id];
 
@@ -405,17 +568,30 @@ fn main() -> Result<()> {
 
     let rt_handle = runtime.handle().clone();
 
-    // Parse endpoint URLs
-    let endpoints = if args.endpoints.len() == 1 && args.endpoints[0] == "ws://localhost:9100" {
-        vec!["ws://localhost:9100".to_string()]
+    println!("bisque-computer v{}", env!("CARGO_PKG_VERSION"));
+
+    // Determine startup mode.
+    // If the user explicitly passed --endpoints, honour them and go straight to dashboard.
+    let explicit_endpoints =
+        args.endpoints.len() != 1 || args.endpoints[0] != "ws://localhost:9100";
+
+    let (app_mode, endpoints) = if explicit_endpoints {
+        let eps = args.endpoints.clone();
+        (AppMode::Dashboard, eps)
+    } else if let Some(saved_url) = read_saved_server_url() {
+        println!("Using saved server URL: {}", saved_url);
+        (AppMode::Dashboard, vec![saved_url])
     } else {
-        args.endpoints
+        println!("No server URL configured — starting setup screen.");
+        // Use a placeholder; no real connection is attempted until setup completes.
+        (AppMode::Setup, vec!["ws://setup-placeholder:9100".to_string()])
     };
 
-    println!("bisque-computer v{}", env!("CARGO_PKG_VERSION"));
-    println!("Connecting to {} endpoint(s):", endpoints.len());
-    for ep in &endpoints {
-        println!("  - {}", ep);
+    if app_mode == AppMode::Dashboard {
+        println!("Connecting to {} endpoint(s):", endpoints.len());
+        for ep in &endpoints {
+            println!("  - {}", ep);
+        }
     }
 
     // Spawn WebSocket client tasks
@@ -474,6 +650,8 @@ fn main() -> Result<()> {
         rt_handle,
         transcription_rx,
         transcription_tx,
+        app_mode,
+        setup_input: String::new(),
     };
 
     let event_loop = EventLoop::new()?;
