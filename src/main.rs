@@ -379,6 +379,29 @@ impl ApplicationHandler for App {
                 }
             }
 
+            // Cmd+V (macOS) or Ctrl+V (Linux/Windows): paste from clipboard in Setup mode.
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        logical_key: Key::Character(ref c),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } if self.app_mode == AppMode::Setup
+                && (c.as_str() == "v" || c.as_str() == "V")
+                && (self.modifiers.state().super_key()
+                    || self.modifiers.state().control_key()) =>
+            {
+                match arboard::Clipboard::new().and_then(|mut cb| cb.get_text()) {
+                    Ok(text) => {
+                        self.setup_input.push_str(&text);
+                        println!("[setup] Pasted {} chars from clipboard", text.len());
+                    }
+                    Err(e) => eprintln!("[setup] Clipboard read failed: {}", e),
+                }
+            }
+
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {

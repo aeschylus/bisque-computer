@@ -1,6 +1,6 @@
 [package]
 name = "bisque-computer"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2024"
 
 [dependencies]
@@ -26,6 +26,9 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # CLI argument parsing
 clap = { version = "4", features = ["derive"] }
+
+# Clipboard access (Cmd+V / Ctrl+V paste support)
+arboard = "3"
 
 # Font rendering
 skrifa = "0.40.0"
