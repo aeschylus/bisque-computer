@@ -10,6 +10,15 @@
 //! On first launch (no config file), shows a setup screen where the user enters
 //! the connection URL. The URL is saved to `~/.config/bisque-computer/server`.
 //!
+//! ## Multi-screen layout
+//!
+//! Three screens are arranged horizontally:
+//! - Screen 0 (Dashboard): existing dashboard
+//! - Screen 1 (Info): memory events + active agents
+//! - Screen 2 (Terminal): PTY-backed terminal emulator
+//!
+//! Cmd+Right / Cmd+Left slides between screens with a spring animation.
+//!
 //! ## State Management
 //!
 //! All app-level state is modelled with `statig` hierarchical state machines
@@ -23,10 +32,12 @@
 //! instances, backed by `parley::PlainEditor`.
 
 mod dashboard;
+mod info_screen;
 mod logging;
 #[allow(dead_code)]
 mod protocol;
 mod state_machine;
+mod terminal;
 mod text_selection;
 mod voice;
 mod ws_client;
@@ -39,6 +50,7 @@ use tracing::{error, info, warn};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
+use vello::kurbo::Affine;
 use vello::peniko::color::palette;
 use vello::peniko::FontData;
 use vello::util::{RenderContext, RenderSurface};
@@ -46,7 +58,7 @@ use vello::{AaConfig, Renderer, RendererOptions, Scene};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalPosition;
 use winit::event::{ElementState, KeyEvent, Modifiers, MouseButton, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Fullscreen, Window};
 
@@ -55,6 +67,7 @@ use vello::wgpu;
 use state_machine::{AppModeEvent, AppModeMachine, VoiceEvent, VoiceMachine};
 use state_machine::voice_sm::State as VoiceState;
 use state_machine::app_mode_sm::State as AppModeState;
+use terminal::TerminalPane;
 use text_selection::{ParleyCtx, SelectableText};
 
 // ---------------------------------------------------------------------------
@@ -135,6 +148,35 @@ struct Args {
 }
 
 // ---------------------------------------------------------------------------
+// Screen index
+// ---------------------------------------------------------------------------
+
+/// The three horizontally-arranged screens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScreenIndex {
+    Dashboard = 0,
+    Info = 1,
+    Terminal = 2,
+}
+
+impl ScreenIndex {
+    fn from_usize(n: usize) -> Self {
+        match n {
+            0 => ScreenIndex::Dashboard,
+            1 => ScreenIndex::Info,
+            2 => ScreenIndex::Terminal,
+            _ => ScreenIndex::Dashboard,
+        }
+    }
+
+    fn to_usize(self) -> usize {
+        self as usize
+    }
+
+    const COUNT: usize = 3;
+}
+
+// ---------------------------------------------------------------------------
 // Render surface lifecycle
 // ---------------------------------------------------------------------------
 
@@ -152,11 +194,21 @@ enum RenderState {
 // App
 // ---------------------------------------------------------------------------
 
+/// Cursor blink interval in milliseconds.
+const CURSOR_BLINK_MS: u64 = 500;
+
+/// Spring constant for screen slide animation.
+const SPRING_K: f64 = 0.2;
+
+/// Snap threshold: stop animating when within this many screen-widths of target.
+const SNAP_THRESHOLD: f64 = 0.001;
+
 struct App {
     // --- Rendering infrastructure ---
     context: RenderContext,
     renderers: Vec<Option<Renderer>>,
     render_state: RenderState,
+    /// Root scene composed from per-screen scenes.
     scene: Scene,
     start_time: Instant,
     windowed: bool,
@@ -178,6 +230,23 @@ struct App {
 
     // --- Setup mode ---
     setup_input: String,
+
+    // --- Multi-screen animation ---
+    /// Current screen (integer target).
+    current_screen: ScreenIndex,
+    /// Animated horizontal offset in screen-widths (0.0 = leftmost screen visible).
+    screen_offset: f64,
+    /// Target offset (updated immediately on Cmd+Arrow).
+    target_offset: f64,
+    /// Whether we are currently animating between screens.
+    animating: bool,
+    /// Timestamp of the last redraw (for animation delta-time, if needed).
+    last_frame: Instant,
+
+    // --- Terminal ---
+    terminal: Option<TerminalPane>,
+    /// Last cursor blink instant.
+    last_blink: Instant,
 }
 
 impl App {
@@ -255,6 +324,40 @@ impl App {
             self.selectable_regions.push(region);
         }
     }
+
+    /// Navigate to the next screen (Cmd+Right).
+    fn navigate_right(&mut self) {
+        let next = (self.current_screen.to_usize() + 1).min(ScreenIndex::COUNT - 1);
+        self.current_screen = ScreenIndex::from_usize(next);
+        self.target_offset = next as f64;
+        self.animating = true;
+    }
+
+    /// Navigate to the previous screen (Cmd+Left).
+    fn navigate_left(&mut self) {
+        let prev = self.current_screen.to_usize().saturating_sub(1);
+        self.current_screen = ScreenIndex::from_usize(prev);
+        self.target_offset = prev as f64;
+        self.animating = true;
+    }
+
+    /// Advance the spring animation one step.
+    ///
+    /// Returns `true` if animation is still in progress (caller should request
+    /// another redraw).
+    fn tick_animation(&mut self) -> bool {
+        if !self.animating {
+            return false;
+        }
+        let delta = self.target_offset - self.screen_offset;
+        if delta.abs() < SNAP_THRESHOLD {
+            self.screen_offset = self.target_offset;
+            self.animating = false;
+            return false;
+        }
+        self.screen_offset += delta * SPRING_K;
+        true
+    }
 }
 
 impl ApplicationHandler for App {
@@ -324,6 +427,10 @@ impl ApplicationHandler for App {
                     if size.width != 0 && size.height != 0 {
                         self.context.resize_surface(surface, size.width, size.height);
                         *valid_surface = true;
+                        // Notify terminal of new size.
+                        if let Some(term) = &mut self.terminal {
+                            term.resize(size.width as f64, size.height as f64);
+                        }
                     } else {
                         *valid_surface = false;
                     }
@@ -358,7 +465,65 @@ impl ApplicationHandler for App {
                         ..
                     },
                 ..
-            } => event_loop.exit(),
+            } if self.current_screen != ScreenIndex::Terminal => event_loop.exit(),
+
+            // Escape in terminal: send ESC to PTY (handled below in the terminal
+            // keyboard routing block).
+
+            // ----------------------------------------------------------------
+            // Multi-screen navigation: Cmd+Right / Cmd+Left
+            // ----------------------------------------------------------------
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        logical_key: Key::Named(NamedKey::ArrowRight),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } if self.modifiers.state().super_key() => {
+                self.navigate_right();
+                if let RenderState::Active { window, .. } = &self.render_state {
+                    window.request_redraw();
+                }
+            }
+
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        logical_key: Key::Named(NamedKey::ArrowLeft),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } if self.modifiers.state().super_key() => {
+                self.navigate_left();
+                if let RenderState::Active { window, .. } = &self.render_state {
+                    window.request_redraw();
+                }
+            }
+
+            // ----------------------------------------------------------------
+            // Terminal screen: keyboard → PTY
+            // ----------------------------------------------------------------
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        ref logical_key,
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } if self.current_screen == ScreenIndex::Terminal => {
+                // Cmd+Left/Right are consumed above, so anything reaching here
+                // that is NOT a Cmd+Arrow goes to the PTY.
+                if !self.modifiers.state().super_key() {
+                    let ctrl = self.modifiers.state().control_key();
+                    if let Some(term) = &mut self.terminal {
+                        term.write_key(logical_key, ctrl);
+                    }
+                }
+            }
 
             // ----------------------------------------------------------------
             // Setup mode: URL input
@@ -463,7 +628,9 @@ impl ApplicationHandler for App {
                         ..
                     },
                 ..
-            } if self.modifiers.state().shift_key() && self.is_dashboard() => {
+            } if self.modifiers.state().shift_key() && self.is_dashboard()
+                && self.current_screen == ScreenIndex::Dashboard =>
+            {
                 match state {
                     ElementState::Pressed => {
                         self.handle_voice_event(VoiceEvent::ShiftEnterPressed);
@@ -476,7 +643,7 @@ impl ApplicationHandler for App {
                 }
             }
 
-            // 'V' key: toggle voice.
+            // 'V' key: toggle voice (dashboard screen only).
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -487,6 +654,7 @@ impl ApplicationHandler for App {
                 ..
             } if (c.as_str() == "v" || c.as_str() == "V")
                 && self.is_dashboard()
+                && self.current_screen == ScreenIndex::Dashboard
                 && !self.modifiers.state().super_key()
                 && !self.modifiers.state().control_key() =>
             {
@@ -499,7 +667,7 @@ impl ApplicationHandler for App {
                 }
             }
 
-            // Cmd+C / Ctrl+C: copy selected text.
+            // Cmd+C / Ctrl+C: copy selected text (non-terminal screens).
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -510,7 +678,8 @@ impl ApplicationHandler for App {
                 ..
             } if (c.as_str() == "c" || c.as_str() == "C")
                 && (self.modifiers.state().super_key()
-                    || self.modifiers.state().control_key()) =>
+                    || self.modifiers.state().control_key())
+                && self.current_screen != ScreenIndex::Terminal =>
             {
                 self.copy_selection_to_clipboard();
             }
@@ -524,14 +693,16 @@ impl ApplicationHandler for App {
                         ..
                     },
                 ..
-            } if (c.as_str() == "r" || c.as_str() == "R") && self.is_dashboard() => {}
+            } if (c.as_str() == "r" || c.as_str() == "R")
+                && self.is_dashboard()
+                && self.current_screen == ScreenIndex::Dashboard => {}
 
             // ----------------------------------------------------------------
-            // Mouse: text selection
+            // Mouse: text selection (dashboard screen only)
             // ----------------------------------------------------------------
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_pos = position;
-                if self.is_dashboard() {
+                if self.is_dashboard() && self.current_screen == ScreenIndex::Dashboard {
                     let x = position.x;
                     let y = position.y;
                     let parley_ctx = &mut self.parley_ctx;
@@ -545,7 +716,7 @@ impl ApplicationHandler for App {
                 state: btn_state,
                 button: MouseButton::Left,
                 ..
-            } if self.is_dashboard() => {
+            } if self.is_dashboard() && self.current_screen == ScreenIndex::Dashboard => {
                 let x = self.cursor_pos.x;
                 let y = self.cursor_pos.y;
                 match btn_state {
@@ -571,8 +742,21 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested => {
                 self.poll_transcription();
 
+                // Drain PTY output before rendering.
+                if let Some(term) = &mut self.terminal {
+                    term.drain_output();
+                }
+
+                // Cursor blink.
+                let blink_elapsed = self.last_blink.elapsed();
+                if blink_elapsed >= std::time::Duration::from_millis(CURSOR_BLINK_MS) {
+                    if let Some(term) = &mut self.terminal {
+                        term.cursor_visible = !term.cursor_visible;
+                    }
+                    self.last_blink = Instant::now();
+                }
+
                 // Compute state snapshots before borrowing the render surface.
-                // Method calls require &self which conflicts with &mut self.render_state.
                 let voice_ui_state = VoiceMachine::ui_state(self.voice_machine.state());
                 let voice_enabled = !matches!(
                     self.voice_machine.state(),
@@ -592,6 +776,10 @@ impl ApplicationHandler for App {
                     return;
                 };
 
+                // Clone the window Arc early so we can use it after releasing the
+                // &mut self.render_state borrow (needed for tick_animation()).
+                let window_arc = window.clone();
+
                 self.scene.reset();
 
                 let width = surface.config.width as f64;
@@ -599,6 +787,7 @@ impl ApplicationHandler for App {
                 let elapsed = self.start_time.elapsed().as_secs_f64();
 
                 if is_setup {
+                    // In setup mode: render setup screen directly (no multi-screen).
                     dashboard::render_setup_screen(
                         &mut self.scene,
                         width,
@@ -607,31 +796,79 @@ impl ApplicationHandler for App {
                         self.font_data.as_ref(),
                     );
                 } else {
-                    let instances = &self.app_mode_machine.inner().instances;
+                    // --- Multi-screen compositing ---
+                    //
+                    // Each screen is rendered into a separate Scene, then composited
+                    // into the root scene with a horizontal Affine::translate.
+                    //
+                    // The offset is in screen-widths:
+                    //   screen_offset = 0.0 → dashboard fully visible (screen 0 at x=0)
+                    //   screen_offset = 1.0 → info screen fully visible (screen 1 at x=0)
+                    //   screen_offset = 2.0 → terminal fully visible (screen 2 at x=0)
 
-                    dashboard::render_dashboard(
-                        &mut self.scene,
-                        width,
-                        height,
-                        instances,
-                        elapsed,
-                        self.font_data.as_ref(),
-                        &voice_ui_state,
-                        voice_enabled,
+                    let offset_px = self.screen_offset * width;
+
+                    // --- Screen 0: Dashboard ---
+                    let mut dashboard_scene = Scene::new();
+                    {
+                        let instances = &self.app_mode_machine.inner().instances;
+                        dashboard::render_dashboard(
+                            &mut dashboard_scene,
+                            width,
+                            height,
+                            instances,
+                            elapsed,
+                            self.font_data.as_ref(),
+                            &voice_ui_state,
+                            voice_enabled,
+                        );
+                        // Render text selection overlays.
+                        let selection_color = vello::peniko::Color::new([0.2_f32, 0.5, 1.0, 0.35]);
+                        let text_color = vello::peniko::Color::new([0.0_f32, 0.0, 0.0, 1.0]);
+                        let parley_ctx = &mut self.parley_ctx;
+                        for region in &mut self.selectable_regions {
+                            region.render_into_scene(
+                                &mut dashboard_scene,
+                                text_color,
+                                selection_color,
+                                parley_ctx,
+                            );
+                        }
+                    }
+                    self.scene.append(
+                        &dashboard_scene,
+                        Some(Affine::translate((0.0 * width - offset_px, 0.0))),
                     );
 
-                    // Render text selection overlays on top of dashboard.
-                    let selection_color = vello::peniko::Color::new([0.2_f32, 0.5, 1.0, 0.35]);
-                    let text_color = vello::peniko::Color::new([0.0_f32, 0.0, 0.0, 1.0]);
-                    let parley_ctx = &mut self.parley_ctx;
-                    for region in &mut self.selectable_regions {
-                        region.render_into_scene(
-                            &mut self.scene,
-                            text_color,
-                            selection_color,
-                            parley_ctx,
+                    // --- Screen 1: Info ---
+                    let mut info_scene = Scene::new();
+                    {
+                        let instances = &self.app_mode_machine.inner().instances;
+                        info_screen::render_info_screen(
+                            &mut info_scene,
+                            width,
+                            height,
+                            instances,
+                            self.font_data.as_ref(),
                         );
                     }
+                    self.scene.append(
+                        &info_scene,
+                        Some(Affine::translate((1.0 * width - offset_px, 0.0))),
+                    );
+
+                    // --- Screen 2: Terminal ---
+                    let mut terminal_scene = Scene::new();
+                    if let Some(term) = &self.terminal {
+                        term.render_into_scene(&mut terminal_scene, 0.0, 0.0, width, height);
+                    } else {
+                        // Terminal not yet spawned; show a placeholder.
+                        render_terminal_placeholder(&mut terminal_scene, width, height, self.font_data.as_ref());
+                    }
+                    self.scene.append(
+                        &terminal_scene,
+                        Some(Affine::translate((2.0 * width - offset_px, 0.0))),
+                    );
                 }
 
                 let device_handle = &self.context.devices[surface.dev_id];
@@ -676,12 +913,47 @@ impl ApplicationHandler for App {
                 surface_texture.present();
                 device_handle.device.poll(wgpu::PollType::Poll).unwrap();
 
-                window.request_redraw();
+                // Advance the spring animation.
+                // `surface` and `window` are no longer used after this point.
+                // The NLL borrow checker allows tick_animation() here because the
+                // mutable borrow of self.render_state doesn't extend past the last use.
+                let still_animating = self.tick_animation();
+                if still_animating {
+                    window_arc.request_redraw();
+                } else {
+                    // Schedule cursor blink wakeup via WaitUntil.
+                    let next_blink = self.last_blink
+                        + std::time::Duration::from_millis(CURSOR_BLINK_MS);
+                    event_loop.set_control_flow(ControlFlow::WaitUntil(next_blink));
+                    window_arc.request_redraw();
+                }
             }
 
             _ => {}
         }
     }
+
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        // Triggered by WaitUntil expiry (cursor blink) or external wakeup.
+        // Re-request a redraw so the terminal cursor blinks.
+        if let RenderState::Active { window, .. } = &self.render_state {
+            window.request_redraw();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Terminal placeholder (shown before terminal is spawned)
+// ---------------------------------------------------------------------------
+
+fn render_terminal_placeholder(scene: &mut Scene, width: f64, height: f64, font_data: Option<&FontData>) {
+    use vello::kurbo::Rect;
+    use vello::peniko::{Color, Fill};
+    use vello::kurbo::Affine;
+    let bg = Color::new([0.08, 0.08, 0.10, 1.0]);
+    scene.fill(Fill::NonZero, Affine::IDENTITY, bg, None, &Rect::new(0.0, 0.0, width, height));
+    let fg = Color::new([0.85, 0.85, 0.90, 1.0]);
+    dashboard::draw_centered_text_pub(scene, width, height, "Terminal (loading...)", fg, 32.0, font_data);
 }
 
 fn main() -> Result<()> {
@@ -777,12 +1049,23 @@ fn main() -> Result<()> {
         initialized.into()
     };
 
+    // Spawn terminal pane.
+    // Use a reasonable default size; will be resized when window is available.
+    let terminal = TerminalPane::spawn(1280.0, 800.0);
+    if terminal.is_some() {
+        info!("Terminal: spawned PTY-backed terminal (Cascadia Code embedded)");
+    } else {
+        warn!("Terminal: failed to spawn PTY — terminal screen will show placeholder");
+    }
+
+    let now = Instant::now();
+
     let mut app = App {
         context: RenderContext::new(),
         renderers: vec![],
         render_state: RenderState::Suspended(None),
         scene: Scene::new(),
-        start_time: Instant::now(),
+        start_time: now,
         windowed: args.windowed,
         font_data,
         mono_font_data,
@@ -793,6 +1076,13 @@ fn main() -> Result<()> {
         parley_ctx: ParleyCtx::new(),
         selectable_regions: Vec::new(),
         setup_input: String::new(),
+        current_screen: ScreenIndex::Dashboard,
+        screen_offset: 0.0,
+        target_offset: 0.0,
+        animating: false,
+        last_frame: now,
+        terminal,
+        last_blink: now,
     };
 
     let event_loop = EventLoop::new()?;
