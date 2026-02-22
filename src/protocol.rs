@@ -3,8 +3,10 @@
 //! Defines the JSON message structures received from the Lobster Dashboard
 //! WebSocket server. All types derive `Deserialize` for automatic parsing.
 //! Fields are kept even if not currently read, for protocol completeness.
+//!
+//! Also defines outbound message types sent from bisque-computer to the server.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Top-level message frame from the server.
 #[derive(Debug, Deserialize, Clone)]
@@ -272,5 +274,42 @@ impl LobsterInstance {
             last_update: None,
             protocol_version: None,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Outbound message types (bisque-computer → Lobster server)
+// ---------------------------------------------------------------------------
+
+/// A voice transcription result sent to the Lobster server as a user message.
+///
+/// The server handles this identically to a Telegram text message, routing
+/// it through the Lobster assistant pipeline.
+#[derive(Debug, Clone, Serialize)]
+pub struct VoiceInputMessage {
+    pub version: String,
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    pub timestamp: String,
+    pub text: String,
+    pub source: String,
+}
+
+impl VoiceInputMessage {
+    /// Construct a new voice input message with the current UTC timestamp.
+    pub fn new(text: String) -> Self {
+        let timestamp = chrono::Utc::now().to_rfc3339();
+        Self {
+            version: "1.0".to_string(),
+            msg_type: "voice_input".to_string(),
+            timestamp,
+            text,
+            source: "bisque-computer".to_string(),
+        }
+    }
+
+    /// Serialize to JSON string for transmission.
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
     }
 }

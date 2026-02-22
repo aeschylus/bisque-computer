@@ -2,11 +2,15 @@
 //!
 //! Runs in a Tokio background task and pushes state updates into
 //! a shared structure that the rendering loop reads from.
+//!
+//! Outbound messages (e.g., voice_input) are queued via `OutboundSender`
+//! and broadcast to all connected instances via per-client mpsc channels.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
+use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -15,28 +19,71 @@ use crate::protocol::{ConnectionStatus, DashboardState, Frame, LobsterInstance};
 /// Shared state accessible from both the WebSocket tasks and the render loop.
 pub type SharedInstances = Arc<Mutex<Vec<LobsterInstance>>>;
 
+/// A cloneable handle for sending outbound JSON messages to all connected
+/// WebSocket instances. Each send is broadcast to every connected client.
+#[derive(Clone)]
+pub struct OutboundSender {
+    /// One sender per registered client instance.
+    senders: Arc<Vec<mpsc::UnboundedSender<String>>>,
+}
+
+impl OutboundSender {
+    fn new(senders: Vec<mpsc::UnboundedSender<String>>) -> Self {
+        Self {
+            senders: Arc::new(senders),
+        }
+    }
+
+    /// Broadcast a JSON payload to all connected instances.
+    ///
+    /// Silently drops sends to disconnected clients (their receivers were dropped).
+    pub fn broadcast(&self, json: String) {
+        for sender in self.senders.iter() {
+            let _ = sender.send(json.clone());
+        }
+    }
+}
+
 /// Spawn WebSocket client tasks for each endpoint URL.
-/// Returns the shared instances handle.
+///
+/// Returns:
+/// - `SharedInstances`: live connection state used by the render loop.
+/// - `OutboundSender`: broadcasts JSON messages to all connected instances.
 pub fn spawn_clients(
     runtime: &tokio::runtime::Runtime,
     urls: Vec<String>,
-) -> SharedInstances {
+) -> (SharedInstances, OutboundSender) {
     let instances: Vec<LobsterInstance> = urls
         .iter()
         .map(|u| LobsterInstance::new(u.clone()))
         .collect();
     let shared = Arc::new(Mutex::new(instances));
 
+    // Build one mpsc channel per client instance for outbound fan-out.
+    let mut per_client_senders: Vec<mpsc::UnboundedSender<String>> = Vec::new();
+
     for (index, url) in urls.into_iter().enumerate() {
+        let (tx, rx) = mpsc::unbounded_channel::<String>();
+        per_client_senders.push(tx);
+
         let shared_clone = Arc::clone(&shared);
-        runtime.spawn(client_loop(shared_clone, index, url));
+        runtime.spawn(client_loop(shared_clone, index, url, rx));
     }
 
-    shared
+    let outbound = OutboundSender::new(per_client_senders);
+    (shared, outbound)
 }
 
 /// Reconnecting client loop for a single Lobster instance.
-async fn client_loop(shared: SharedInstances, index: usize, url: String) {
+///
+/// Accepts outbound messages via `outbound_rx` and forwards them to the server
+/// when connected.
+async fn client_loop(
+    shared: SharedInstances,
+    index: usize,
+    url: String,
+    mut outbound_rx: mpsc::UnboundedReceiver<String>,
+) {
     loop {
         // Update status to Connecting
         {
@@ -58,27 +105,38 @@ async fn client_loop(shared: SharedInstances, index: usize, url: String) {
 
                 let (mut write, mut read) = ws_stream.split();
 
-                // Read messages from the server
-                while let Some(msg_result) = read.next().await {
-                    match msg_result {
-                        Ok(Message::Text(text)) => {
-                            handle_message(&shared, index, &text);
-                        }
-                        Ok(Message::Ping(data)) => {
-                            let _ = write.send(Message::Pong(data)).await;
-                        }
-                        Ok(Message::Close(_)) => {
-                            break;
-                        }
-                        Err(e) => {
-                            let mut instances = shared.lock().unwrap();
-                            if let Some(inst) = instances.get_mut(index) {
-                                inst.status =
-                                    ConnectionStatus::Error(format!("WS error: {}", e));
+                loop {
+                    tokio::select! {
+                        // Inbound: messages from the server
+                        msg_result = read.next() => {
+                            match msg_result {
+                                Some(Ok(Message::Text(text))) => {
+                                    handle_message(&shared, index, &text);
+                                }
+                                Some(Ok(Message::Ping(data))) => {
+                                    let _ = write.send(Message::Pong(data)).await;
+                                }
+                                Some(Ok(Message::Close(_))) | None => break,
+                                Some(Err(e)) => {
+                                    let mut instances = shared.lock().unwrap();
+                                    if let Some(inst) = instances.get_mut(index) {
+                                        inst.status =
+                                            ConnectionStatus::Error(format!("WS error: {}", e));
+                                    }
+                                    break;
+                                }
+                                _ => {}
                             }
-                            break;
                         }
-                        _ => {}
+
+                        // Outbound: messages queued by voice input or other features
+                        Some(json) = outbound_rx.recv() => {
+                            let msg = Message::Text(json.into());
+                            if let Err(e) = write.send(msg).await {
+                                eprintln!("Failed to send outbound message: {}", e);
+                                break;
+                            }
+                        }
                     }
                 }
 
