@@ -359,6 +359,13 @@ impl ApplicationHandler for App {
                     match save_server_url(&url) {
                         Ok(()) => {
                             println!("[setup] Saved server URL: {}", url);
+                            // Extract whisper host from the WebSocket URL host.
+                            if let Ok(parsed) = url::Url::parse(&url) {
+                                if let Some(h) = parsed.host_str() {
+                                    self.voice_config.whisper_host = h.to_string();
+                                    println!("[setup] whisper host set to: {}", h);
+                                }
+                            }
                             // Spawn a fresh WebSocket client for the saved URL.
                             let rt = tokio::runtime::Builder::new_multi_thread()
                                 .enable_all()
@@ -642,10 +649,19 @@ fn main() -> Result<()> {
         voice_config.enabled = false;
     }
 
+    // Derive whisper host from the WebSocket endpoint host — the same server
+    // that runs the Lobster dashboard also runs the whisper.cpp HTTP server.
+    if app_mode == AppMode::Dashboard && !endpoints.is_empty() {
+        if let Ok(parsed) = url::Url::parse(&endpoints[0]) {
+            if let Some(h) = parsed.host_str() {
+                voice_config.whisper_host = h.to_string();
+            }
+        }
+    }
+
     if voice_config.enabled {
         println!("Voice input: enabled (Shift+Enter to record, V to toggle)");
-        println!("  whisper-cli:  {}", voice_config.whisper_cli);
-        println!("  whisper model: {}", voice_config.whisper_model);
+        println!("  whisper host:  {}", voice_config.whisper_host);
         println!("  whisper port:  {}", voice_config.whisper_port);
     } else {
         println!("Voice input: disabled (--no-voice flag set)");

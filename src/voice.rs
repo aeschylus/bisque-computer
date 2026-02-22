@@ -22,6 +22,9 @@ pub struct VoiceConfig {
     pub whisper_cli: String,
     /// Path to the whisper model file.
     pub whisper_model: String,
+    /// Hostname or IP of the whisper.cpp HTTP server (default: "localhost").
+    /// Set to the Lobster server host so the Mac client can reach it remotely.
+    pub whisper_host: String,
     /// Port for the whisper.cpp HTTP server sidecar.
     pub whisper_port: u16,
 }
@@ -34,6 +37,7 @@ impl Default for VoiceConfig {
                 .to_string(),
             whisper_model: "/home/admin/lobster-workspace/whisper.cpp/models/ggml-small.bin"
                 .to_string(),
+            whisper_host: "localhost".to_string(),
             whisper_port: 8178,
         }
     }
@@ -274,13 +278,14 @@ pub struct TranscriptionResult {
 
 /// Call the whisper.cpp HTTP server to transcribe a WAV byte blob.
 ///
-/// Sends a multipart POST to `http://localhost:{port}/inference`.
+/// Sends a multipart POST to `http://{host}:{port}/inference`.
 /// Returns the trimmed transcription text on success.
 pub async fn transcribe_via_server(
     wav_bytes: Vec<u8>,
+    host: &str,
     port: u16,
 ) -> Result<TranscriptionResult> {
-    let url = format!("http://localhost:{}/inference", port);
+    let url = format!("http://{}:{}/inference", host, port);
 
     let part = reqwest::multipart::Part::bytes(wav_bytes)
         .file_name("audio.wav")
@@ -391,7 +396,7 @@ pub async fn transcribe_via_cli(
 
 /// Attempt transcription: try HTTP server first, fall back to CLI subprocess.
 pub async fn transcribe(wav_bytes: Vec<u8>, config: &VoiceConfig) -> Result<TranscriptionResult> {
-    match transcribe_via_server(wav_bytes.clone(), config.whisper_port).await {
+    match transcribe_via_server(wav_bytes.clone(), &config.whisper_host, config.whisper_port).await {
         Ok(result) => Ok(result),
         Err(server_err) => {
             eprintln!(
