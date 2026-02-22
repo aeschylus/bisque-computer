@@ -4,10 +4,13 @@
 //! Dashboard WebSocket servers and visualizes system state in real time.
 //!
 //! Uses vello/wgpu for rendering and tokio-tungstenite for WebSocket communication.
+//! Voice input (Shift+Enter push-to-talk) transcribes audio via whisper.cpp and
+//! sends the result as a voice_input message over the existing WebSocket connection.
 
 mod dashboard;
 #[allow(dead_code)]
 mod protocol;
+mod voice;
 mod ws_client;
 
 use anyhow::Result;
@@ -19,14 +22,15 @@ use vello::peniko::FontData;
 use vello::util::{RenderContext, RenderSurface};
 use vello::{AaConfig, Renderer, RendererOptions, Scene};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, KeyEvent, WindowEvent};
+use winit::event::{ElementState, KeyEvent, Modifiers, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Fullscreen, Window};
 
 use vello::wgpu;
 
-use ws_client::SharedInstances;
+use voice::{VoiceConfig, VoiceUiState};
+use ws_client::{OutboundSender, SharedInstances};
 
 /// Lobster Instance Dashboard
 #[derive(Parser, Debug)]
@@ -39,6 +43,10 @@ struct Args {
     /// Start in windowed mode instead of fullscreen
     #[arg(short, long)]
     windowed: bool,
+
+    /// Disable voice input
+    #[arg(long)]
+    no_voice: bool,
 }
 
 #[derive(Debug)]
@@ -58,12 +66,105 @@ struct App {
     scene: Scene,
     start_time: Instant,
     instances: SharedInstances,
+    outbound: OutboundSender,
     windowed: bool,
     /// Readable font (Optima on macOS, fallbacks on other platforms)
     font_data: Option<FontData>,
     /// Monospace font (Monaco on macOS, fallbacks on other platforms)
     #[allow(dead_code)]
     mono_font_data: Option<FontData>,
+
+    // --- Voice input state ---
+    voice_config: VoiceConfig,
+    /// Current modifier state (tracks Shift held).
+    modifiers: Modifiers,
+    /// Live recording session; `Some` while Shift+Enter is held.
+    recording: Option<voice::RecordingState>,
+    /// UI feedback state for the dashboard renderer.
+    voice_ui: VoiceUiState,
+    /// Tokio runtime handle for spawning async transcription tasks.
+    rt_handle: tokio::runtime::Handle,
+    /// Channel for receiving transcription results from the async task.
+    transcription_rx: std::sync::mpsc::Receiver<Result<voice::TranscriptionResult, String>>,
+    transcription_tx: std::sync::mpsc::SyncSender<Result<voice::TranscriptionResult, String>>,
+}
+
+impl App {
+    /// Begin audio capture. Called on Shift+Enter keydown.
+    fn start_recording(&mut self) {
+        if !self.voice_config.enabled {
+            return;
+        }
+        if self.recording.is_some() {
+            return; // already recording
+        }
+        match voice::start_recording() {
+            Ok(rec) => {
+                self.recording = Some(rec);
+                self.voice_ui = VoiceUiState::Recording;
+                println!("[voice] Recording started");
+            }
+            Err(e) => {
+                eprintln!("[voice] Failed to start recording: {}", e);
+                self.voice_ui = VoiceUiState::Error(e.to_string());
+            }
+        }
+    }
+
+    /// Stop audio capture and spawn async transcription. Called on key release.
+    fn stop_and_transcribe(&mut self) {
+        let rec = match self.recording.take() {
+            Some(r) => r,
+            None => return,
+        };
+
+        self.voice_ui = VoiceUiState::Transcribing;
+        println!("[voice] Recording stopped, transcribing...");
+
+        let samples = voice::stop_and_collect(&rec);
+        let sample_rate = rec.sample_rate;
+        let channels = rec.channels;
+        let config = self.voice_config.clone();
+        let tx = self.transcription_tx.clone();
+
+        self.rt_handle.spawn(async move {
+            let result: Result<voice::TranscriptionResult, String> = async {
+                let wav = voice::encode_to_wav(&samples, sample_rate, channels)
+                    .map_err(|e| e.to_string())?;
+                voice::transcribe(wav, &config)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+            .await;
+            let _ = tx.send(result);
+        });
+    }
+
+    /// Poll the transcription channel and handle any completed result.
+    ///
+    /// Called every frame from `window_event` RedrawRequested.
+    fn poll_transcription(&mut self) {
+        match self.transcription_rx.try_recv() {
+            Ok(Ok(result)) => {
+                let text = result.text.clone();
+                println!("[voice] Transcribed: {:?}", text);
+
+                if !text.is_empty() {
+                    let msg = protocol::VoiceInputMessage::new(text.clone());
+                    self.outbound.broadcast(msg.to_json());
+                }
+
+                self.voice_ui = VoiceUiState::Done(text);
+            }
+            Ok(Err(e)) => {
+                eprintln!("[voice] Transcription failed: {}", e);
+                self.voice_ui = VoiceUiState::Error(e);
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+        }
+    }
+
 }
 
 impl ApplicationHandler for App {
@@ -109,17 +210,29 @@ impl ApplicationHandler for App {
         window_id: winit::window::WindowId,
         event: WindowEvent,
     ) {
-        let (surface, valid_surface, window) = match &mut self.state {
-            RenderState::Active {
-                surface,
-                valid_surface,
-                window,
-            } if window.id() == window_id => (surface, valid_surface, window.clone()),
-            _ => return,
+        // Verify this event is for our window
+        let is_our_window = match &self.state {
+            RenderState::Active { window, .. } => window.id() == window_id,
+            _ => false,
         };
+        if !is_our_window {
+            return;
+        }
 
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+
+            // Track modifier state for push-to-talk detection.
+            WindowEvent::ModifiersChanged(new_mods) => {
+                let shift_was_held = self.modifiers.state().shift_key();
+                self.modifiers = new_mods;
+                let shift_now_held = self.modifiers.state().shift_key();
+
+                // If Shift was released while recording, stop and transcribe.
+                if shift_was_held && !shift_now_held && self.recording.is_some() {
+                    self.stop_and_transcribe();
+                }
+            }
 
             WindowEvent::KeyboardInput {
                 event:
@@ -130,6 +243,44 @@ impl ApplicationHandler for App {
                     },
                 ..
             } => event_loop.exit(),
+
+            // Shift+Enter: start recording on press, stop on release.
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        logical_key: Key::Named(NamedKey::Enter),
+                        state,
+                        repeat: false,
+                        ..
+                    },
+                ..
+            } if self.modifiers.state().shift_key() => match state {
+                ElementState::Pressed => self.start_recording(),
+                ElementState::Released => {
+                    if self.recording.is_some() {
+                        self.stop_and_transcribe();
+                    }
+                }
+            },
+
+            // 'V' key: toggle voice input on/off
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        logical_key: Key::Character(ref c),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } if c.as_str() == "v" || c.as_str() == "V" => {
+                self.voice_config.enabled = !self.voice_config.enabled;
+                let status = if self.voice_config.enabled { "enabled" } else { "disabled" };
+                println!("[voice] Voice input {}", status);
+                if !self.voice_config.enabled {
+                    self.recording = None;
+                    self.voice_ui = VoiceUiState::Idle;
+                }
+            }
 
             // Press 'R' to request a fresh snapshot from all servers
             WindowEvent::KeyboardInput {
@@ -146,19 +297,35 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::Resized(size) => {
-                if size.width != 0 && size.height != 0 {
-                    self.context
-                        .resize_surface(surface, size.width, size.height);
-                    *valid_surface = true;
-                } else {
-                    *valid_surface = false;
+                if let RenderState::Active {
+                    surface,
+                    valid_surface,
+                    ..
+                } = &mut self.state
+                {
+                    if size.width != 0 && size.height != 0 {
+                        self.context.resize_surface(surface, size.width, size.height);
+                        *valid_surface = true;
+                    } else {
+                        *valid_surface = false;
+                    }
                 }
             }
 
             WindowEvent::RedrawRequested => {
-                if !*valid_surface {
+                // Poll for completed transcription results before borrowing surface.
+                self.poll_transcription();
+
+                // Render: borrow only the fields we need, avoiding a full &mut self borrow
+                // while the surface reference is live.
+                let RenderState::Active {
+                    surface,
+                    valid_surface: true,
+                    window,
+                } = &mut self.state
+                else {
                     return;
-                }
+                };
 
                 self.scene.reset();
 
@@ -166,7 +333,6 @@ impl ApplicationHandler for App {
                 let height = surface.config.height as f64;
                 let elapsed = self.start_time.elapsed().as_secs_f64();
 
-                // Render the dashboard
                 dashboard::render_dashboard(
                     &mut self.scene,
                     width,
@@ -174,6 +340,8 @@ impl ApplicationHandler for App {
                     &self.instances,
                     elapsed,
                     self.font_data.as_ref(),
+                    &self.voice_ui,
+                    self.voice_config.enabled,
                 );
 
                 let device_handle = &self.context.devices[surface.dev_id];
@@ -218,7 +386,6 @@ impl ApplicationHandler for App {
                 surface_texture.present();
                 device_handle.device.poll(wgpu::PollType::Poll).unwrap();
 
-                // Request another frame for continuous updates
                 window.request_redraw();
             }
 
@@ -230,15 +397,16 @@ impl ApplicationHandler for App {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Create the Tokio runtime for async WebSocket clients
+    // Create the Tokio runtime for async WebSocket clients and transcription
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("Failed to create Tokio runtime");
 
+    let rt_handle = runtime.handle().clone();
+
     // Parse endpoint URLs
     let endpoints = if args.endpoints.len() == 1 && args.endpoints[0] == "ws://localhost:9100" {
-        // Default: single local instance
         vec!["ws://localhost:9100".to_string()]
     } else {
         args.endpoints
@@ -251,10 +419,9 @@ fn main() -> Result<()> {
     }
 
     // Spawn WebSocket client tasks
-    let instances = ws_client::spawn_clients(&runtime, endpoints);
+    let (instances, outbound) = ws_client::spawn_clients(&runtime, endpoints);
 
     // Load fonts at startup
-    // Optima for readable text (all UI text), Monaco for monospace (code display)
     let font_data = dashboard::load_readable_font();
     let mono_font_data = dashboard::load_mono_font();
 
@@ -270,6 +437,25 @@ fn main() -> Result<()> {
         eprintln!("Note: No monospace font found (Monaco/Menlo/DejaVu Sans Mono).");
     }
 
+    // Voice config
+    let mut voice_config = VoiceConfig::default();
+    if args.no_voice {
+        voice_config.enabled = false;
+    }
+
+    if voice_config.enabled {
+        println!("Voice input: enabled (Shift+Enter to record, V to toggle)");
+        println!("  whisper-cli:  {}", voice_config.whisper_cli);
+        println!("  whisper model: {}", voice_config.whisper_model);
+        println!("  whisper port:  {}", voice_config.whisper_port);
+    } else {
+        println!("Voice input: disabled (--no-voice flag set)");
+    }
+
+    // Sync channel for transcription results (async task → main event loop)
+    let (transcription_tx, transcription_rx) =
+        std::sync::mpsc::sync_channel::<Result<voice::TranscriptionResult, String>>(4);
+
     let mut app = App {
         context: RenderContext::new(),
         renderers: vec![],
@@ -277,9 +463,17 @@ fn main() -> Result<()> {
         scene: Scene::new(),
         start_time: Instant::now(),
         instances,
+        outbound,
         windowed: args.windowed,
         font_data,
         mono_font_data,
+        voice_config,
+        modifiers: Modifiers::default(),
+        recording: None,
+        voice_ui: VoiceUiState::Idle,
+        rt_handle,
+        transcription_rx,
+        transcription_tx,
     };
 
     let event_loop = EventLoop::new()?;

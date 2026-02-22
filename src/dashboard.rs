@@ -12,6 +12,7 @@ use vello::peniko::{Color, Fill, FontData};
 use vello::{Glyph, Scene};
 
 use crate::protocol::{ConnectionStatus, LobsterInstance};
+use crate::voice::VoiceUiState;
 use crate::ws_client::SharedInstances;
 
 // --- Color palette (bisque beige theme) ---
@@ -86,6 +87,10 @@ const FADE_OUT_DURATION: f64 = 2.0;  // seconds to fade out
 const TOTAL_SPLASH_DURATION: f64 = FADE_IN_DURATION + HOLD_DURATION + FADE_OUT_DURATION;
 
 /// Top-level render function: draws the full dashboard.
+///
+/// `voice_ui` carries the current push-to-talk state so the renderer can
+/// show a recording indicator, "Transcribing..." overlay, and the result text.
+/// `voice_enabled` controls whether the Shift+Enter hint is shown in the header.
 pub fn render_dashboard(
     scene: &mut Scene,
     width: f64,
@@ -93,6 +98,8 @@ pub fn render_dashboard(
     instances: &SharedInstances,
     elapsed: f64,
     font_data: Option<&FontData>,
+    voice_ui: &VoiceUiState,
+    voice_enabled: bool,
 ) {
     // Background fill - bisque beige
     let bg_rect = Rect::new(0.0, 0.0, width, height);
@@ -122,6 +129,24 @@ pub fn render_dashboard(
         .count();
     let status_text = format!("{}/{} connected", connected, instances.len());
     draw_text_with_font(scene, width - 400.0, 50.0, &status_text, TEXT_LIGHT, 28.0, font_data);
+
+    // Voice input hint in header (shown when enabled and idle)
+    if voice_enabled {
+        let hint = match voice_ui {
+            VoiceUiState::Idle => "  |  Shift+Enter: voice",
+            VoiceUiState::Recording => "  |  Recording...",
+            VoiceUiState::Transcribing => "  |  Transcribing...",
+            VoiceUiState::Done(_) => "  |  Sent",
+            VoiceUiState::Error(_) => "  |  Voice error",
+        };
+        let hint_color = match voice_ui {
+            VoiceUiState::Recording => Color::new([1.0_f32, 0.3, 0.3, 1.0]), // red while live
+            VoiceUiState::Transcribing => Color::new([0.9_f32, 0.75, 0.1, 1.0]), // amber
+            VoiceUiState::Done(_) => Color::new([0.3_f32, 0.8, 0.4, 1.0]),   // green
+            _ => Color::new([1.0_f32, 1.0, 1.0, 0.60]),
+        };
+        draw_text_with_font(scene, width - 400.0, 72.0, hint, hint_color, 22.0, font_data);
+    }
 
     // Layout: panels in a grid with 3D visualization
     let content_top = HEADER_HEIGHT + MARGIN;
@@ -175,6 +200,133 @@ pub fn render_dashboard(
         for (idx, instance) in instances.iter().enumerate() {
             let vx = MARGIN + idx as f64 * (viz_panel_w + PANEL_GAP);
             draw_3d_visualization(scene, vx, viz_top, viz_panel_w, viz_height, instance, elapsed, font_data);
+        }
+    }
+
+    // Voice input overlay — drawn on top of everything else so it's always visible.
+    // Drop the instances lock before drawing the overlay (already dropped at end of scope).
+    drop(instances);
+    draw_voice_indicator(scene, width, height, voice_ui, elapsed, font_data);
+}
+
+/// Draw the voice recording / transcribing / result overlay.
+///
+/// The indicator is anchored to the bottom-right corner. It shows:
+/// - A pulsing red circle while recording.
+/// - An amber "Transcribing..." badge while waiting for whisper.
+/// - A green "Sent" confirmation after the text is dispatched.
+/// - An error message in red on failure.
+fn draw_voice_indicator(
+    scene: &mut Scene,
+    width: f64,
+    height: f64,
+    voice_ui: &VoiceUiState,
+    elapsed: f64,
+    font_data: Option<&FontData>,
+) {
+    match voice_ui {
+        VoiceUiState::Idle => {} // Nothing to draw
+
+        VoiceUiState::Recording => {
+            // Pulsing red circle (mic-on indicator)
+            let pulse = ((elapsed * 4.0).sin() * 0.5 + 0.5) as f32; // 0..1 at 4Hz
+            let radius = 16.0 + 6.0 * pulse as f64;
+            let cx = width - MARGIN - radius;
+            let cy = height - MARGIN - radius;
+
+            // Glow halo
+            let halo_alpha = 0.25 + 0.15 * pulse;
+            let halo_color = Color::new([0.9_f32, 0.1, 0.1, halo_alpha]);
+            draw_circle(scene, cx, cy, radius * 2.0, halo_color);
+
+            // Solid red dot
+            let dot_color = Color::new([0.85_f32, 0.12, 0.10, 1.0]);
+            draw_circle(scene, cx, cy, radius, dot_color);
+
+            // "REC" label
+            draw_text_with_font(
+                scene,
+                cx - radius - 60.0,
+                cy + 8.0,
+                "REC",
+                dot_color,
+                28.0,
+                font_data,
+            );
+        }
+
+        VoiceUiState::Transcribing => {
+            // Amber pill badge: "Transcribing..."
+            let badge_w = 280.0;
+            let badge_h = 44.0;
+            let bx = width - MARGIN - badge_w;
+            let by = height - MARGIN - badge_h;
+            let badge_rect = RoundedRect::new(bx, by, bx + badge_w, by + badge_h, 10.0);
+            let badge_bg = Color::new([0.85_f32, 0.60, 0.10, 0.92]);
+            scene.fill(Fill::NonZero, Affine::IDENTITY, badge_bg, None, &badge_rect);
+            draw_text_with_font(
+                scene,
+                bx + 16.0,
+                by + 30.0,
+                "Transcribing...",
+                Color::new([1.0_f32, 1.0, 1.0, 1.0]),
+                24.0,
+                font_data,
+            );
+        }
+
+        VoiceUiState::Done(text) => {
+            // Green pill badge with truncated transcribed text
+            let max_chars = 40;
+            let display_text: String = if text.len() > max_chars {
+                format!("{}...", &text[..max_chars])
+            } else {
+                text.clone()
+            };
+            let badge_label = format!("Sent: {}", display_text);
+            let badge_w = (badge_label.len() as f64 * 13.0 + 40.0).min(width * 0.6);
+            let badge_h = 44.0;
+            let bx = width - MARGIN - badge_w;
+            let by = height - MARGIN - badge_h;
+            let badge_rect = RoundedRect::new(bx, by, bx + badge_w, by + badge_h, 10.0);
+            let badge_bg = Color::new([0.22_f32, 0.62, 0.30, 0.92]);
+            scene.fill(Fill::NonZero, Affine::IDENTITY, badge_bg, None, &badge_rect);
+            draw_text_with_font(
+                scene,
+                bx + 16.0,
+                by + 30.0,
+                &badge_label,
+                Color::new([1.0_f32, 1.0, 1.0, 1.0]),
+                22.0,
+                font_data,
+            );
+        }
+
+        VoiceUiState::Error(msg) => {
+            // Red pill badge with error summary
+            let max_chars = 50;
+            let display_msg: String = if msg.len() > max_chars {
+                format!("{}...", &msg[..max_chars])
+            } else {
+                msg.clone()
+            };
+            let badge_label = format!("Voice error: {}", display_msg);
+            let badge_w = (badge_label.len() as f64 * 12.0 + 40.0).min(width * 0.65);
+            let badge_h = 44.0;
+            let bx = width - MARGIN - badge_w;
+            let by = height - MARGIN - badge_h;
+            let badge_rect = RoundedRect::new(bx, by, bx + badge_w, by + badge_h, 10.0);
+            let badge_bg = Color::new([0.78_f32, 0.15, 0.12, 0.92]);
+            scene.fill(Fill::NonZero, Affine::IDENTITY, badge_bg, None, &badge_rect);
+            draw_text_with_font(
+                scene,
+                bx + 16.0,
+                by + 30.0,
+                &badge_label,
+                Color::new([1.0_f32, 1.0, 1.0, 1.0]),
+                22.0,
+                font_data,
+            );
         }
     }
 }
