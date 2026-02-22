@@ -830,6 +830,16 @@ fn draw_centered_text(scene: &mut Scene, width: f64, height: f64, text: &str, co
     draw_text_with_font(scene, x, y, text, color, size, font_data);
 }
 
+/// Public wrapper for `draw_centered_text`, used by other modules.
+pub fn draw_centered_text_pub(scene: &mut Scene, width: f64, height: f64, text: &str, color: Color, size: f64, font_data: Option<&FontData>) {
+    draw_centered_text(scene, width, height, text, color, size, font_data);
+}
+
+/// Public wrapper for `draw_text_with_font`, used by other modules.
+pub fn draw_text_pub(scene: &mut Scene, x: f64, y: f64, text: &str, color: Color, size: f64, font_data: Option<&FontData>) {
+    draw_text_with_font(scene, x, y, text, color, size, font_data);
+}
+
 /// Draw a filled circle.
 fn draw_circle(scene: &mut Scene, cx: f64, cy: f64, r: f64, color: Color) {
     let circle = vello::kurbo::Circle::new(Point::new(cx, cy), r);
