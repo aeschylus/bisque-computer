@@ -32,6 +32,7 @@
 //! instances, backed by `parley::PlainEditor`.
 
 mod dashboard;
+mod design;
 mod info_screen;
 mod logging;
 #[allow(dead_code)]
@@ -48,7 +49,7 @@ use statig::prelude::*;
 use statig::blocking::StateMachine;
 use tracing::{error, info, warn};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use vello::kurbo::Affine;
 use vello::peniko::color::palette;
@@ -67,6 +68,7 @@ use vello::wgpu;
 use state_machine::{AppModeEvent, AppModeMachine, VoiceEvent, VoiceMachine};
 use state_machine::voice_sm::State as VoiceState;
 use state_machine::app_mode_sm::State as AppModeState;
+use design::DesignTokens;
 use terminal::TerminalPane;
 use text_selection::{ParleyCtx, SelectableText};
 
@@ -204,6 +206,9 @@ const SPRING_K: f64 = 0.2;
 const SNAP_THRESHOLD: f64 = 0.001;
 
 struct App {
+    // --- Design tokens ---
+    tokens: Arc<RwLock<DesignTokens>>,
+
     // --- Rendering infrastructure ---
     context: RenderContext,
     renderers: Vec<Option<Renderer>>,
@@ -349,13 +354,14 @@ impl App {
         if !self.animating {
             return false;
         }
+        let tokens = self.tokens.read().unwrap();
         let delta = self.target_offset - self.screen_offset;
-        if delta.abs() < SNAP_THRESHOLD {
+        if delta.abs() < tokens.animation.snap_threshold {
             self.screen_offset = self.target_offset;
             self.animating = false;
             return false;
         }
-        self.screen_offset += delta * SPRING_K;
+        self.screen_offset += delta * tokens.animation.spring_k;
         true
     }
 }
@@ -747,9 +753,12 @@ impl ApplicationHandler for App {
                     term.drain_output();
                 }
 
+                // Acquire design tokens for this frame.
+                let tokens = self.tokens.read().unwrap();
+
                 // Cursor blink.
                 let blink_elapsed = self.last_blink.elapsed();
-                if blink_elapsed >= std::time::Duration::from_millis(CURSOR_BLINK_MS) {
+                if blink_elapsed >= std::time::Duration::from_millis(tokens.animation.cursor_blink_ms) {
                     if let Some(term) = &mut self.terminal {
                         term.cursor_visible = !term.cursor_visible;
                     }
@@ -821,6 +830,7 @@ impl ApplicationHandler for App {
                             self.font_data.as_ref(),
                             &voice_ui_state,
                             voice_enabled,
+                            &tokens,
                         );
                         // Render text selection overlays.
                         let selection_color = vello::peniko::Color::new([0.2_f32, 0.5, 1.0, 0.35]);
@@ -850,6 +860,7 @@ impl ApplicationHandler for App {
                             height,
                             instances,
                             self.font_data.as_ref(),
+                            &tokens,
                         );
                     }
                     self.scene.append(
@@ -860,7 +871,7 @@ impl ApplicationHandler for App {
                     // --- Screen 2: Terminal ---
                     let mut terminal_scene = Scene::new();
                     if let Some(term) = &self.terminal {
-                        term.render_into_scene(&mut terminal_scene, 0.0, 0.0, width, height);
+                        term.render_into_scene(&mut terminal_scene, 0.0, 0.0, width, height, &tokens);
                     } else {
                         // Terminal not yet spawned; show a placeholder.
                         render_terminal_placeholder(&mut terminal_scene, width, height, self.font_data.as_ref());
@@ -870,6 +881,9 @@ impl ApplicationHandler for App {
                         Some(Affine::translate((2.0 * width - offset_px, 0.0))),
                     );
                 }
+
+                // Release the design tokens read lock before GPU submission.
+                drop(tokens);
 
                 let device_handle = &self.context.devices[surface.dev_id];
 
@@ -922,8 +936,9 @@ impl ApplicationHandler for App {
                     window_arc.request_redraw();
                 } else {
                     // Schedule cursor blink wakeup via WaitUntil.
+                    let blink_ms = self.tokens.read().unwrap().animation.cursor_blink_ms;
                     let next_blink = self.last_blink
-                        + std::time::Duration::from_millis(CURSOR_BLINK_MS);
+                        + std::time::Duration::from_millis(blink_ms);
                     event_loop.set_control_flow(ControlFlow::WaitUntil(next_blink));
                     window_arc.request_redraw();
                 }
@@ -1061,6 +1076,7 @@ fn main() -> Result<()> {
     let now = Instant::now();
 
     let mut app = App {
+        tokens: Arc::new(RwLock::new(DesignTokens::default())),
         context: RenderContext::new(),
         renderers: vec![],
         render_state: RenderState::Suspended(None),

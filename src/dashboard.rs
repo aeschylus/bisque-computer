@@ -11,6 +11,7 @@ use vello::kurbo::{Affine, BezPath, Point, Rect, RoundedRect};
 use vello::peniko::{Color, Fill, FontData};
 use vello::{Glyph, Scene};
 
+use crate::design::DesignTokens;
 use crate::protocol::{ConnectionStatus, LobsterInstance};
 use crate::voice::VoiceUiState;
 use crate::ws_client::SharedInstances;
@@ -100,10 +101,11 @@ pub fn render_dashboard(
     font_data: Option<&FontData>,
     voice_ui: &VoiceUiState,
     voice_enabled: bool,
+    tokens: &DesignTokens,
 ) {
-    // Background fill - bisque beige
+    // Background fill - bisque beige (from design tokens)
     let bg_rect = Rect::new(0.0, 0.0, width, height);
-    scene.fill(Fill::NonZero, Affine::IDENTITY, BG_COLOR, None, &bg_rect);
+    scene.fill(Fill::NonZero, Affine::IDENTITY, tokens.bg_color(), None, &bg_rect);
 
     // Ulysses splash quote overlay (fades in and out on app open)
     if elapsed < TOTAL_SPLASH_DURATION {
@@ -1697,6 +1699,7 @@ fn disk_color(percent: f64) -> Color {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+    use crate::design::DesignTokens;
 
     // --- Color constant tests ---
 
@@ -2081,7 +2084,7 @@ mod tests {
         let mut scene = Scene::new();
         let instances = Arc::new(Mutex::new(Vec::new()));
         // Should not panic when rendering with no instances
-        render_dashboard(&mut scene, 1280.0, 800.0, &instances, 0.0, None);
+        render_dashboard(&mut scene, 1280.0, 800.0, &instances, 0.0, None, &VoiceUiState::Idle, true, &DesignTokens::default());
     }
 
     #[test]
@@ -2090,7 +2093,7 @@ mod tests {
         let instance = crate::protocol::LobsterInstance::new("ws://localhost:9100".to_string());
         let instances = Arc::new(Mutex::new(vec![instance]));
         // Should not panic, and should still render 3D viz (demo mode)
-        render_dashboard(&mut scene, 1280.0, 800.0, &instances, 0.0, None);
+        render_dashboard(&mut scene, 1280.0, 800.0, &instances, 0.0, None, &VoiceUiState::Idle, true, &DesignTokens::default());
     }
 
     #[test]
@@ -2103,7 +2106,7 @@ mod tests {
         instance.state.system.memory.percent = 60.0;
         instance.state.system.disk.percent = 30.0;
         let instances = Arc::new(Mutex::new(vec![instance]));
-        render_dashboard(&mut scene, 1280.0, 800.0, &instances, 0.0, None);
+        render_dashboard(&mut scene, 1280.0, 800.0, &instances, 0.0, None, &VoiceUiState::Idle, true, &DesignTokens::default());
     }
 
     #[test]
@@ -2114,7 +2117,7 @@ mod tests {
         inst1.state.system.hostname = "host1".to_string();
         let inst2 = crate::protocol::LobsterInstance::new("ws://host2:9100".to_string());
         let instances = Arc::new(Mutex::new(vec![inst1, inst2]));
-        render_dashboard(&mut scene, 1920.0, 1080.0, &instances, 5.0, None);
+        render_dashboard(&mut scene, 1920.0, 1080.0, &instances, 5.0, None, &VoiceUiState::Idle, true, &DesignTokens::default());
     }
 
     #[test]
@@ -2122,9 +2125,9 @@ mod tests {
         let mut scene = Scene::new();
         let instances = Arc::new(Mutex::new(Vec::new()));
         // During splash animation (elapsed < TOTAL_SPLASH_DURATION)
-        render_dashboard(&mut scene, 1280.0, 800.0, &instances, 1.0, None);
-        render_dashboard(&mut scene, 1280.0, 800.0, &instances, 4.0, None);
-        render_dashboard(&mut scene, 1280.0, 800.0, &instances, 7.0, None);
+        render_dashboard(&mut scene, 1280.0, 800.0, &instances, 1.0, None, &VoiceUiState::Idle, true, &DesignTokens::default());
+        render_dashboard(&mut scene, 1280.0, 800.0, &instances, 4.0, None, &VoiceUiState::Idle, true, &DesignTokens::default());
+        render_dashboard(&mut scene, 1280.0, 800.0, &instances, 7.0, None, &VoiceUiState::Idle, true, &DesignTokens::default());
     }
 
     #[test]
@@ -2132,7 +2135,7 @@ mod tests {
         let mut scene = Scene::new();
         let instances = Arc::new(Mutex::new(Vec::new()));
         // After splash
-        render_dashboard(&mut scene, 1280.0, 800.0, &instances, 100.0, None);
+        render_dashboard(&mut scene, 1280.0, 800.0, &instances, 100.0, None, &VoiceUiState::Idle, true, &DesignTokens::default());
     }
 
     #[test]

@@ -45,6 +45,8 @@ use vello::kurbo::{Affine, Rect};
 use vello::peniko::{Color, Fill, FontData};
 use winit::keyboard::{Key, NamedKey};
 
+use crate::design::DesignTokens;
+
 // Cascadia Code embedded in the binary (SIL OFL license).
 // Attribution: Copyright (c) Microsoft Corporation
 const CASCADIA_CODE_BYTES: &[u8] = include_bytes!("../assets/CascadiaCode.ttf");
@@ -273,7 +275,7 @@ impl TerminalPane {
     ///
     /// `offset_x` and `offset_y` are the top-left pixel position of the terminal
     /// area within the window.
-    pub fn render_into_scene(&self, scene: &mut Scene, offset_x: f64, offset_y: f64, width: f64, height: f64) {
+    pub fn render_into_scene(&self, scene: &mut Scene, offset_x: f64, offset_y: f64, width: f64, height: f64, _tokens: &DesignTokens) {
         // Background fill.
         let bg_rect = Rect::new(offset_x, offset_y, offset_x + width, offset_y + height);
         scene.fill(Fill::NonZero, Affine::IDENTITY, TERM_BG, None, &bg_rect);

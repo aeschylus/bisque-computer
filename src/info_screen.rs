@@ -10,6 +10,7 @@ use vello::Scene;
 use vello::kurbo::{Affine, Rect, RoundedRect};
 use vello::peniko::{Color, Fill, FontData};
 
+use crate::design::DesignTokens;
 use crate::ws_client::SharedInstances;
 
 // --- Color palette (reused from dashboard theme) ---
@@ -40,12 +41,13 @@ pub fn render_info_screen(
     height: f64,
     instances: &SharedInstances,
     font_data: Option<&FontData>,
+    tokens: &DesignTokens,
 ) {
-    // Background fill.
+    // Background fill (from design tokens).
     scene.fill(
         Fill::NonZero,
         Affine::IDENTITY,
-        BG_COLOR,
+        tokens.bg_color(),
         None,
         &Rect::new(0.0, 0.0, width, height),
     );
