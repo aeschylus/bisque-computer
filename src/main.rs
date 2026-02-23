@@ -40,6 +40,7 @@ mod protocol;
 mod state_machine;
 mod terminal;
 mod text_selection;
+mod token_watcher;
 mod voice;
 mod ws_client;
 
@@ -1072,6 +1073,22 @@ fn main() -> Result<()> {
     } else {
         warn!("Terminal: failed to spawn PTY — terminal screen will show placeholder");
     }
+
+    // TODO(layer-3): Wire token watcher into App
+    // let tokens = Arc::new(RwLock::new(DesignTokens::default()));
+    // let tokens_for_watcher = tokens.clone();
+    // let watcher = token_watcher::TokenFileWatcher::start(move |toml_content| {
+    //     match DesignTokens::from_toml(&toml_content) {
+    //         Ok(new_tokens) => {
+    //             if let Ok(mut t) = tokens_for_watcher.write() {
+    //                 *t = new_tokens;
+    //             }
+    //             // proxy.send_event(UserEvent::TokensChanged).ok();
+    //         }
+    //         Err(e) => eprintln!("design.toml parse error (keeping previous): {e}"),
+    //     }
+    // }).expect("Failed to start token file watcher");
+    // info!("Watching design tokens at: {}", watcher.path().display());
 
     let now = Instant::now();
 

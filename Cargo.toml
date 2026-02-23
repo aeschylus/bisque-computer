@@ -52,3 +52,9 @@ hound = "3.5"
 reqwest = { version = "0.12", features = ["multipart", "json"] }
 portable-pty = "0.9"
 alacritty_terminal = "0.25"
+
+# File watching for design token hot-reload
+notify = "7"
+
+# TOML parsing for design tokens
+toml = "0.8"
