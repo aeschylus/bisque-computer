@@ -34,6 +34,7 @@
 mod dashboard;
 #[allow(dead_code)]
 mod design;
+mod design_repl;
 mod info_screen;
 mod logging;
 mod pane_tree;
@@ -107,7 +108,7 @@ fn config_base_dir() -> PathBuf {
     }
 }
 
-fn home_dir() -> PathBuf {
+pub(crate) fn home_dir() -> PathBuf {
     std::env::var("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/tmp"))
@@ -255,6 +256,9 @@ struct App {
     pane_tree: Option<PaneTree>,
     /// Last cursor blink instant.
     last_blink: Instant,
+
+    // --- Design REPL ---
+    design_repl: design_repl::DesignRepl,
 }
 
 impl App {
@@ -496,6 +500,46 @@ impl ApplicationHandler for App {
             }
 
             // ----------------------------------------------------------------
+            // Design REPL toggle: Cmd+Shift+I
+            // ----------------------------------------------------------------
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        logical_key: Key::Character(ref c),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } if (c.as_str() == "i" || c.as_str() == "I")
+                && self.modifiers.state().super_key()
+                && self.modifiers.state().shift_key() =>
+            {
+                self.design_repl.toggle();
+                if let RenderState::Active { window, .. } = &self.render_state {
+                    window.request_redraw();
+                }
+            }
+
+            // ----------------------------------------------------------------
+            // Design REPL keyboard routing (when active, captures all keys)
+            // ----------------------------------------------------------------
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        ref logical_key,
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } if self.design_repl.is_active() => {
+                let ctrl = self.modifiers.state().control_key();
+                self.design_repl.handle_key(logical_key, ctrl, &self.tokens);
+                if let RenderState::Active { window, .. } = &self.render_state {
+                    window.request_redraw();
+                }
+            }
+
+            // ----------------------------------------------------------------
             // Terminal screen: pane management (Cmd+D, Cmd+Shift+D, Cmd+W, Cmd+], Cmd+[)
             // ----------------------------------------------------------------
 
@@ -556,7 +600,6 @@ impl ApplicationHandler for App {
             {
                 if let Some(tree) = &mut self.pane_tree {
                     if !tree.close_focused() {
-                        // Last pane closed — show placeholder.
                         self.pane_tree = None;
                     }
                 }
@@ -1043,6 +1086,11 @@ impl ApplicationHandler for App {
                     );
                 }
 
+                // Design REPL overlay (rendered on top of everything).
+                if self.design_repl.is_active() {
+                    self.design_repl.render(&mut self.scene, width, height, &tokens);
+                }
+
                 // Release the design tokens read lock before GPU submission.
                 drop(tokens);
 
@@ -1267,6 +1315,7 @@ fn main() -> Result<()> {
         last_frame: now,
         pane_tree,
         last_blink: now,
+        design_repl: design_repl::DesignRepl::new(),
     };
 
     let event_loop = EventLoop::new()?;
