@@ -166,12 +166,12 @@ impl Default for InkTokens {
     fn default() -> Self {
         Self {
             primary: 1.0,
-            section: 0.80,
-            body: 0.70,
-            secondary: 0.50,
-            annotation: 0.40,
+            section: 0.92,
+            body: 0.85,
+            secondary: 0.85,
+            annotation: 0.75,
             rule: 0.15,
-            ghost: 0.08,
+            ghost: 0.60,
         }
     }
 }
@@ -348,12 +348,12 @@ mod tests {
 
         // Ink
         assert!((t.ink.primary - 1.0).abs() < f64::EPSILON);
-        assert!((t.ink.section - 0.80).abs() < f64::EPSILON);
-        assert!((t.ink.body - 0.70).abs() < f64::EPSILON);
-        assert!((t.ink.secondary - 0.50).abs() < f64::EPSILON);
-        assert!((t.ink.annotation - 0.40).abs() < f64::EPSILON);
+        assert!((t.ink.section - 0.92).abs() < f64::EPSILON);
+        assert!((t.ink.body - 0.85).abs() < f64::EPSILON);
+        assert!((t.ink.secondary - 0.85).abs() < f64::EPSILON);
+        assert!((t.ink.annotation - 0.75).abs() < f64::EPSILON);
         assert!((t.ink.rule - 0.15).abs() < f64::EPSILON);
-        assert!((t.ink.ghost - 0.08).abs() < f64::EPSILON);
+        assert!((t.ink.ghost - 0.60).abs() < f64::EPSILON);
 
         // Type scale
         assert!((t.type_scale.base - 18.0).abs() < f64::EPSILON);
@@ -421,7 +421,7 @@ secondary = 0.3
         // Default values for everything else
         assert!((tokens.background.r - 1.0).abs() < f64::EPSILON);
         assert!((tokens.type_scale.base - 18.0).abs() < f64::EPSILON);
-        assert!((tokens.ink.body - 0.70).abs() < f64::EPSILON);
+        assert!((tokens.ink.body - 0.85).abs() < f64::EPSILON);
     }
 
     #[test]

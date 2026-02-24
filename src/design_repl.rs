@@ -788,7 +788,7 @@ mod tests {
     fn resolve_get_ink() {
         let t = DesignTokens::default();
         assert_eq!(resolve_get(&t, "ink.primary").unwrap(), "1.000");
-        assert_eq!(resolve_get(&t, "ink.body").unwrap(), "0.700");
+        assert_eq!(resolve_get(&t, "ink.body").unwrap(), "0.850");
     }
 
     #[test]
@@ -877,6 +877,6 @@ mod tests {
         tokens.write().unwrap().ink.body = 0.1;
         repl.execute("defaults", &tokens);
         let t = tokens.read().unwrap();
-        assert!((t.ink.body - 0.70).abs() < f64::EPSILON);
+        assert!((t.ink.body - 0.85).abs() < f64::EPSILON);
     }
 }

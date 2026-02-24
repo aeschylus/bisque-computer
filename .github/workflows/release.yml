@@ -49,8 +49,8 @@ jobs:
           cp "target/${{ matrix.target }}/release/bisque-computer" \
              "${APP}/Contents/MacOS/bisque-computer"
 
-          # Copy sandbox profile into the bundle
-          cp sandbox/claude-sandbox.sb "${APP}/Contents/Resources/claude-sandbox.sb"
+          # Copy app icon into the bundle
+          cp assets/AppIcon.icns "${APP}/Contents/Resources/AppIcon.icns"
 
           # Create Info.plist
           /usr/libexec/PlistBuddy -c "Clear dict" "${APP}/Contents/Info.plist"
@@ -62,6 +62,7 @@ jobs:
           /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string '${APP_VERSION}'" "${APP}/Contents/Info.plist"
           /usr/libexec/PlistBuddy -c "Add :CFBundlePackageType string 'APPL'" "${APP}/Contents/Info.plist"
           /usr/libexec/PlistBuddy -c "Add :CFBundleInfoDictionaryVersion string '6.0'" "${APP}/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string 'AppIcon'" "${APP}/Contents/Info.plist"
           /usr/libexec/PlistBuddy -c "Add :NSHighResolutionCapable bool true" "${APP}/Contents/Info.plist"
           /usr/libexec/PlistBuddy -c "Add :NSSupportsAutomaticGraphicsSwitching bool true" "${APP}/Contents/Info.plist"
 

@@ -482,26 +482,28 @@ fn spawn_pane_for_backend(
 
             info!(image = DOCKER_IMAGE, "Spawning Docker container for Claude Code");
 
+            // Pass ANTHROPIC_API_KEY from host env so Claude boots authenticated.
+            // Generate the token on the host via `claude setup-token`.
             let api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
-            let mut args: Vec<&str> = vec!["run", "-it", "--rm"];
-
-            // Pass ANTHROPIC_API_KEY into the container so Claude
-            // boots past the interactive sign-in.
-            let env_flag;
+            let mut args: Vec<String> = vec![
+                "run".into(), "-it".into(), "--rm".into(),
+                "-v".into(), "bisque-claude-config:/home/claude/.claude".into(),
+            ];
             if !api_key.is_empty() {
-                env_flag = format!("ANTHROPIC_API_KEY={}", api_key);
-                args.extend_from_slice(&["-e", &env_flag]);
+                args.push("-e".into());
+                args.push(format!("ANTHROPIC_API_KEY={}", api_key));
             } else {
-                warn!("ANTHROPIC_API_KEY not set — Claude will prompt for auth inside the container");
+                warn!("ANTHROPIC_API_KEY not set — run `claude setup-token` and export the token");
             }
-
-            args.extend_from_slice(&[DOCKER_IMAGE, "--dangerously-skip-permissions"]);
+            args.push(DOCKER_IMAGE.into());
+            args.push("--dangerously-skip-permissions".into());
+            let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
             TerminalPane::spawn_command(
                 width,
                 height,
                 "docker",
-                &args,
+                &args_refs,
                 &[],
             )
         }

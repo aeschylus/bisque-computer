@@ -15,9 +15,9 @@ use crate::ws_client::SharedInstances;
 // --- Color palette (typography-only) ---
 const BG_COLOR: Color = Color::new([1.0, 0.894, 0.769, 1.0]);
 const TEXT_PRIMARY: Color = Color::new([0.0, 0.0, 0.0, 1.0]);
-const TEXT_SECONDARY: Color = Color::new([0.0, 0.0, 0.0, 0.50]);
-const TEXT_SECTION: Color = Color::new([0.0, 0.0, 0.0, 0.80]);
-const TEXT_ANNOTATION: Color = Color::new([0.0, 0.0, 0.0, 0.40]);
+const TEXT_SECONDARY: Color = Color::new([0.0, 0.0, 0.0, 0.85]);
+const TEXT_SECTION: Color = Color::new([0.0, 0.0, 0.0, 0.92]);
+const TEXT_ANNOTATION: Color = Color::new([0.0, 0.0, 0.0, 0.75]);
 const RULE_COLOR: Color = Color::new([0.0, 0.0, 0.0, 0.15]);
 
 // --- Typography sizes ---

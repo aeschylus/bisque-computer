@@ -34,11 +34,14 @@ use std::sync::{Arc, Mutex};
 use alacritty_terminal::Term;
 use alacritty_terminal::event::EventListener;
 use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::Config;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::vte::ansi::{Color as AlaColor, NamedColor, Processor, Rgb};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tokio::sync::mpsc as tokio_mpsc;
+use tracing::info;
 use vello::Glyph;
 use vello::Scene;
 use vello::kurbo::{Affine, Rect};
@@ -55,6 +58,9 @@ const TERM_BG: Color = Color::new([1.0, 0.894, 0.769, 1.0]);
 const TERM_FG: Color = Color::new([0.0, 0.0, 0.0, 1.0]);
 /// Cursor color: dark brown, visible on bisque.
 const TERM_CURSOR: Color = Color::new([0.40, 0.26, 0.13, 0.85]);
+
+/// Selection highlight color.
+const TERM_SELECTION: Color = Color::new([0.2, 0.5, 1.0, 0.35]);
 
 /// Horizontal padding (one cell width on each side).
 const TERM_PAD_CELLS: usize = 1;
@@ -184,6 +190,9 @@ pub struct TerminalPane {
 
     /// Cursor blink state (toggled from main loop).
     pub cursor_visible: bool,
+
+    /// Whether a mouse drag selection is in progress.
+    selecting: bool,
 }
 
 impl TerminalPane {
@@ -269,6 +278,7 @@ impl TerminalPane {
             cols,
             rows,
             cursor_visible: true,
+            selecting: false,
         })
     }
 
@@ -355,6 +365,7 @@ impl TerminalPane {
             cols,
             rows,
             cursor_visible: true,
+            selecting: false,
         })
     }
 
@@ -391,6 +402,7 @@ impl TerminalPane {
             cols,
             rows,
             cursor_visible: true,
+            selecting: false,
         }
     }
 
@@ -493,6 +505,89 @@ impl TerminalPane {
         self.resize(self.pixel_width, self.pixel_height);
     }
 
+    /// Convert pixel coordinates to a viewport column/row and Side.
+    fn pixel_to_viewport(&self, x: f64, y: f64, offset_x: f64, offset_y: f64) -> (usize, usize, Side) {
+        let pad_px = self.cell_width as f64 * TERM_PAD_CELLS as f64;
+        let col = ((x - offset_x - pad_px) / self.cell_width as f64)
+            .floor()
+            .clamp(0.0, (self.cols.saturating_sub(1)) as f64) as usize;
+        let row = ((y - offset_y) / self.cell_height as f64)
+            .floor()
+            .clamp(0.0, (self.rows.saturating_sub(1)) as f64) as usize;
+        let rel = (x - offset_x - pad_px) % self.cell_width as f64;
+        let side = if rel < self.cell_width as f64 / 2.0 {
+            Side::Left
+        } else {
+            Side::Right
+        };
+        (col, row, side)
+    }
+
+    /// Convert a viewport row to an absolute grid Point (accounting for scroll).
+    fn viewport_to_grid_point(col: usize, viewport_row: usize, display_offset: usize) -> Point {
+        // In alacritty_terminal, Line(0) is the top of the active screen area.
+        // Viewport row 0 with display_offset maps to Line(-(display_offset as i32)).
+        let line = viewport_row as i32 - display_offset as i32;
+        Point::new(Line(line), Column(col))
+    }
+
+    /// Start a selection at the given pixel position.
+    ///
+    /// `offset_x` / `offset_y` are the top-left of the terminal area in window coords.
+    pub fn mouse_press(&mut self, x: f64, y: f64, offset_x: f64, offset_y: f64) {
+        let (col, row, side) = self.pixel_to_viewport(x, y, offset_x, offset_y);
+        let mut term = self.term.lock().unwrap();
+        let display_offset = term.grid().display_offset();
+        let point = Self::viewport_to_grid_point(col, row, display_offset);
+        let sel = Selection::new(SelectionType::Simple, point, side);
+        term.selection = Some(sel);
+        self.selecting = true;
+    }
+
+    /// Extend the selection during a drag.
+    pub fn mouse_drag(&mut self, x: f64, y: f64, offset_x: f64, offset_y: f64) {
+        if !self.selecting {
+            return;
+        }
+        let (col, row, side) = self.pixel_to_viewport(x, y, offset_x, offset_y);
+        let mut term = self.term.lock().unwrap();
+        let display_offset = term.grid().display_offset();
+        let point = Self::viewport_to_grid_point(col, row, display_offset);
+        if let Some(ref mut sel) = term.selection {
+            sel.update(point, side);
+        }
+    }
+
+    /// End the selection on mouse release.
+    pub fn mouse_release(&mut self) {
+        self.selecting = false;
+    }
+
+    /// Get the currently selected text, if any.
+    pub fn selected_text(&self) -> Option<String> {
+        let term = self.term.lock().unwrap();
+        term.selection_to_string()
+    }
+
+    /// Copy the current selection to the system clipboard.
+    /// Returns true if text was copied.
+    pub fn copy_selection(&self) -> bool {
+        if let Some(text) = self.selected_text() {
+            if !text.is_empty() {
+                match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(text.clone())) {
+                    Ok(()) => {
+                        info!(target: "terminal", "Copied {} chars to clipboard", text.len());
+                        return true;
+                    }
+                    Err(e) => {
+                        tracing::error!(target: "terminal", "Clipboard write failed: {}", e);
+                    }
+                }
+            }
+        }
+        false
+    }
+
     /// Render the terminal cell grid into a vello `Scene`.
     ///
     /// `offset_x` and `offset_y` are the top-left pixel position of the terminal
@@ -505,6 +600,7 @@ impl TerminalPane {
         let term = self.term.lock().unwrap();
         let content = term.renderable_content();
         let colors = content.colors;
+        let display_offset = content.display_offset;
 
         let cw = self.cell_width as f64;
         let ch = self.cell_height as f64;
@@ -513,40 +609,45 @@ impl TerminalPane {
         let pad_px = cw * TERM_PAD_CELLS as f64;
         let offset_x = offset_x + pad_px;
 
-        // We'll accumulate glyphs for a single draw_glyphs call per color group,
-        // but for correctness and simplicity we issue one call per glyph run.
-        // In a future optimization pass, glyphs of the same color could be batched.
+        // The first visible grid line is Line(-(display_offset as i32)).
+        let first_visible_line = -(display_offset as i32);
+
         let mut fg_glyphs: Vec<(Color, Vec<Glyph>)> = Vec::new();
 
         for cell in content.display_iter {
             let col = cell.point.column.0;
-            let row = cell.point.line.0 as usize;
+            // Convert grid-absolute line to viewport row.
+            let viewport_row = (cell.point.line.0 - first_visible_line) as usize;
 
-            // Skip cells outside the viewport.
-            if col >= self.cols || row >= self.rows {
+            if col >= self.cols || viewport_row >= self.rows {
                 continue;
             }
 
             let cell_x = offset_x + col as f64 * cw;
-            let cell_y = offset_y + row as f64 * ch;
+            let cell_y = offset_y + viewport_row as f64 * ch;
 
-            // Compute background and foreground colors.
             let (bg_color, fg_color) = resolve_cell_colors(&cell.cell, colors);
 
-            // Draw background if not the default terminal bg.
             let bg_default = TERM_BG;
             if bg_color != bg_default {
                 let rect = Rect::new(cell_x, cell_y, cell_x + cw, cell_y + ch);
                 scene.fill(Fill::NonZero, Affine::IDENTITY, bg_color, None, &rect);
             }
 
-            // Skip wide-char spacers and empty cells.
+            // Draw selection highlight using the cell's grid-absolute point
+            // (matches SelectionRange coordinate space).
+            if let Some(ref sel) = content.selection {
+                if sel.contains(cell.point) {
+                    let rect = Rect::new(cell_x, cell_y, cell_x + cw, cell_y + ch);
+                    scene.fill(Fill::NonZero, Affine::IDENTITY, TERM_SELECTION, None, &rect);
+                }
+            }
+
             let ch_val = cell.cell.c;
             if ch_val == ' ' || ch_val == '\0' || cell.cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
                 continue;
             }
 
-            // Resolve glyph ID.
             let font_ref = skrifa::FontRef::from_index(self.font.data.as_ref(), self.font.index);
             if let Ok(font_ref) = font_ref {
                 use skrifa::MetadataProvider;
@@ -558,7 +659,6 @@ impl TerminalPane {
                     x: cell_x as f32,
                     y: baseline_y as f32,
                 };
-                // Batch with existing glyphs of the same color, or start new batch.
                 if let Some(batch) = fg_glyphs.iter_mut().find(|(c, _)| *c == fg_color) {
                     batch.1.push(glyph);
                 } else {

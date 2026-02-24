@@ -21,9 +21,9 @@ use crate::ws_client::SharedInstances;
 
 const BG_COLOR: Color = Color::new([1.0, 0.894, 0.769, 1.0]);        // CSS bisque background
 const TEXT_PRIMARY: Color = Color::new([0.0, 0.0, 0.0, 1.0]);        // pure black (#000000)
-const TEXT_SECONDARY: Color = Color::new([0.0, 0.0, 0.0, 0.50]);     // black at 50% opacity
-const TEXT_SECTION: Color = Color::new([0.0, 0.0, 0.0, 0.80]);       // black at 80% opacity (section titles)
-const TEXT_ANNOTATION: Color = Color::new([0.0, 0.0, 0.0, 0.40]);    // black at 40% opacity (small annotations)
+const TEXT_SECONDARY: Color = Color::new([0.0, 0.0, 0.0, 0.85]);     // black at 85% opacity
+const TEXT_SECTION: Color = Color::new([0.0, 0.0, 0.0, 0.92]);       // black at 92% opacity (section titles)
+const TEXT_ANNOTATION: Color = Color::new([0.0, 0.0, 0.0, 0.75]);    // black at 75% opacity (small annotations)
 const RULE_COLOR: Color = Color::new([0.0, 0.0, 0.0, 0.15]);         // black at 15% opacity (thin rules)
 
 // --- Typography design system ---
@@ -83,6 +83,16 @@ pub fn render_dashboard(
     let bg_rect = Rect::new(0.0, 0.0, width, height);
     scene.fill(Fill::NonZero, Affine::IDENTITY, tokens.bg_color(), None, &bg_rect);
 
+    // Scale factor: allows Cmd+=/- to resize all dashboard text.
+    let scale = tokens.type_scale.base / 18.0;
+    let title_size = TITLE_SIZE * scale;
+    let section_size = SECTION_SIZE * scale;
+    let data_primary_size = DATA_PRIMARY_SIZE * scale;
+    let data_secondary_size = DATA_SECONDARY_SIZE * scale;
+    let annotation_size = ANNOTATION_SIZE * scale;
+    // Suppress unused warnings — not all may be used depending on data.
+    let _ = (title_size, section_size, data_primary_size, data_secondary_size, annotation_size);
+
     // Ulysses splash quote overlay (fades in and out on app open)
     if elapsed < TOTAL_SPLASH_DURATION {
         draw_splash_quote(scene, width, height, elapsed, font_data);
@@ -91,13 +101,13 @@ pub fn render_dashboard(
     let instances = instances.lock().unwrap();
 
     if instances.is_empty() {
-        draw_centered_text(scene, width, height, "No Lobster instances configured", TEXT_SECONDARY, 40.0, font_data);
+        draw_centered_text(scene, width, height, "No Lobster instances configured", TEXT_SECONDARY, 40.0 * scale, font_data);
         return;
     }
 
     // Page title — large Optima text with generous whitespace
     let title_y = 56.0;
-    draw_text_with_font(scene, LEFT_MARGIN, title_y, "Lobster Dashboard", TEXT_PRIMARY, TITLE_SIZE, font_data);
+    draw_text_with_font(scene, LEFT_MARGIN, title_y, "Lobster Dashboard", TEXT_PRIMARY, title_size, font_data);
 
     // Connection status as secondary text next to title
     let connected = instances
@@ -105,7 +115,7 @@ pub fn render_dashboard(
         .filter(|i| i.status == ConnectionStatus::Connected)
         .count();
     let status_text = format!("{}/{} connected", connected, instances.len());
-    draw_text_with_font(scene, width - 300.0, title_y, &status_text, TEXT_SECONDARY, DATA_SECONDARY_SIZE, font_data);
+    draw_text_with_font(scene, width - 300.0, title_y, &status_text, TEXT_SECONDARY, data_secondary_size, font_data);
 
     // Voice input hint (shown when enabled)
     if voice_enabled {
@@ -117,12 +127,12 @@ pub fn render_dashboard(
             VoiceUiState::Error(_) => "Voice error",
         };
         let hint_opacity = match voice_ui {
-            VoiceUiState::Recording => 0.80_f32,
-            VoiceUiState::Transcribing => 0.60,
-            _ => 0.40,
+            VoiceUiState::Recording => 1.0_f32,
+            VoiceUiState::Transcribing => 0.85,
+            _ => 0.75,
         };
         let hint_color = Color::new([0.0_f32, 0.0, 0.0, hint_opacity]);
-        draw_text_with_font(scene, width - 300.0, title_y + 28.0, hint, hint_color, ANNOTATION_SIZE, font_data);
+        draw_text_with_font(scene, width - 300.0, title_y + 28.0, hint, hint_color, annotation_size, font_data);
     }
 
     // Content area starts below the title
@@ -134,7 +144,7 @@ pub fn render_dashboard(
 
     if num_instances == 1 {
         // Single instance: full width
-        draw_instance_panel(scene, LEFT_MARGIN, content_top, content_width, content_height, &instances[0], font_data);
+        draw_instance_panel(scene, LEFT_MARGIN, content_top, content_width, content_height, &instances[0], font_data, scale);
     } else {
         // Multiple instances: vertical flow or two-column
         let cols = if num_instances <= 2 { num_instances } else if num_instances <= 4 { 2 } else { 3 };
@@ -151,7 +161,7 @@ pub fn render_dashboard(
             let x = LEFT_MARGIN + col as f64 * (panel_width + col_gap);
             let y = content_top + row as f64 * (panel_height + row_gap);
 
-            draw_instance_panel(scene, x, y, panel_width, panel_height, instance, font_data);
+            draw_instance_panel(scene, x, y, panel_width, panel_height, instance, font_data, scale);
         }
     }
 
@@ -279,7 +289,13 @@ fn draw_instance_panel(
     h: f64,
     instance: &LobsterInstance,
     font_data: Option<&FontData>,
+    scale: f64,
 ) {
+    let data_primary_size = DATA_PRIMARY_SIZE * scale;
+    let data_secondary_size = DATA_SECONDARY_SIZE * scale;
+    let section_size = SECTION_SIZE * scale;
+    let annotation_size = ANNOTATION_SIZE * scale;
+    let _ = (section_size, annotation_size);
     let mut cursor_y = y;
 
     // --- Hostname in large text ---
@@ -298,8 +314,8 @@ fn draw_instance_panel(
         ConnectionStatus::Disconnected => "disconnected".to_string(),
         ConnectionStatus::Error(e) => format!("error: {}", &e[..e.len().min(30)]),
     };
-    cursor_y += DATA_SECONDARY_SIZE * LINE_HEIGHT_FACTOR;
-    draw_text_with_font(scene, x, cursor_y, &status_str, TEXT_SECONDARY, DATA_SECONDARY_SIZE, font_data);
+    cursor_y += data_secondary_size * LINE_HEIGHT_FACTOR;
+    draw_text_with_font(scene, x, cursor_y, &status_str, TEXT_SECONDARY, data_secondary_size, font_data);
 
     if instance.status != ConnectionStatus::Connected {
         return;
@@ -309,54 +325,54 @@ fn draw_instance_panel(
     cursor_y += SECTION_SPACING;
 
     // --- System section ---
-    cursor_y = draw_section_header_with_font(scene, x, cursor_y, w, "System", font_data);
+    cursor_y = draw_section_header_with_font(scene, x, cursor_y, w, "System", font_data, scale);
 
     // Uptime
     let uptime_str = format_uptime(state.system.uptime_seconds);
-    draw_label_value_with_font(scene, x, cursor_y, "Uptime", &uptime_str, w, font_data);
-    cursor_y += DATA_PRIMARY_SIZE * LINE_HEIGHT_FACTOR;
+    draw_label_value_with_font(scene, x, cursor_y, "Uptime", &uptime_str, w, font_data, scale);
+    cursor_y += data_primary_size * LINE_HEIGHT_FACTOR;
 
     // CPU, Memory, Disk as text-only: "CPU  42%"
     let cpu_str = format!("{:.0}%", state.system.cpu.percent);
-    draw_label_value_with_font(scene, x, cursor_y, "CPU", &cpu_str, w, font_data);
-    cursor_y += DATA_PRIMARY_SIZE * LINE_HEIGHT_FACTOR;
+    draw_label_value_with_font(scene, x, cursor_y, "CPU", &cpu_str, w, font_data, scale);
+    cursor_y += data_primary_size * LINE_HEIGHT_FACTOR;
 
     let mem_str = format!("{:.0}%", state.system.memory.percent);
-    draw_label_value_with_font(scene, x, cursor_y, "Memory", &mem_str, w, font_data);
-    cursor_y += DATA_PRIMARY_SIZE * LINE_HEIGHT_FACTOR;
+    draw_label_value_with_font(scene, x, cursor_y, "Memory", &mem_str, w, font_data, scale);
+    cursor_y += data_primary_size * LINE_HEIGHT_FACTOR;
 
     let disk_str = format!("{:.0}%", state.system.disk.percent);
-    draw_label_value_with_font(scene, x, cursor_y, "Disk", &disk_str, w, font_data);
+    draw_label_value_with_font(scene, x, cursor_y, "Disk", &disk_str, w, font_data, scale);
     cursor_y += SECTION_SPACING;
 
     // --- Sessions section ---
-    cursor_y = draw_section_header_with_font(scene, x, cursor_y, w, "Sessions", font_data);
+    cursor_y = draw_section_header_with_font(scene, x, cursor_y, w, "Sessions", font_data, scale);
 
     let claude_sessions: Vec<_> = state.sessions.iter()
         .filter(|s| s.name == "claude")
         .collect();
     let session_count = claude_sessions.len();
-    draw_label_value_with_font(scene, x, cursor_y, "Active", &format!("{}", session_count), w, font_data);
-    cursor_y += DATA_PRIMARY_SIZE * LINE_HEIGHT_FACTOR;
+    draw_label_value_with_font(scene, x, cursor_y, "Active", &format!("{}", session_count), w, font_data, scale);
+    cursor_y += data_primary_size * LINE_HEIGHT_FACTOR;
 
     // Show each session as text
     for session in claude_sessions.iter().take(3) {
         let label = format!("PID {}", session.pid);
         let value = format!("{:.0} MB", session.memory_mb);
-        draw_text_with_font(scene, x + 16.0, cursor_y, &label, TEXT_ANNOTATION, DATA_SECONDARY_SIZE, font_data);
+        draw_text_with_font(scene, x + 16.0, cursor_y, &label, TEXT_ANNOTATION, data_secondary_size, font_data);
         let value_width = value.len() as f64 * 12.0;
-        draw_text_with_font(scene, (x + w - value_width).max(x + 100.0), cursor_y, &value, TEXT_PRIMARY, DATA_SECONDARY_SIZE, font_data);
-        cursor_y += DATA_SECONDARY_SIZE * LINE_HEIGHT_FACTOR;
+        draw_text_with_font(scene, (x + w - value_width).max(x + 100.0), cursor_y, &value, TEXT_PRIMARY, data_secondary_size, font_data);
+        cursor_y += data_secondary_size * LINE_HEIGHT_FACTOR;
     }
     if session_count > 3 {
-        draw_text_with_font(scene, x + 16.0, cursor_y, &format!("+{} more", session_count - 3), TEXT_ANNOTATION, ANNOTATION_SIZE, font_data);
-        cursor_y += ANNOTATION_SIZE * LINE_HEIGHT_FACTOR;
+        draw_text_with_font(scene, x + 16.0, cursor_y, &format!("+{} more", session_count - 3), TEXT_ANNOTATION, annotation_size, font_data);
+        cursor_y += annotation_size * LINE_HEIGHT_FACTOR;
     }
-    cursor_y += SECTION_SPACING - DATA_SECONDARY_SIZE * LINE_HEIGHT_FACTOR;
+    cursor_y += SECTION_SPACING - data_secondary_size * LINE_HEIGHT_FACTOR;
 
     // --- Messages section ---
     if cursor_y + 100.0 < y + h {
-        cursor_y = draw_section_header_with_font(scene, x, cursor_y, w, "Messages", font_data);
+        cursor_y = draw_section_header_with_font(scene, x, cursor_y, w, "Messages", font_data, scale);
 
         let queues = &state.message_queues;
         let queue_items = [
@@ -367,26 +383,26 @@ fn draw_instance_panel(
         ];
 
         for (label, count) in &queue_items {
-            draw_label_value_with_font(scene, x, cursor_y, label, &count.to_string(), w, font_data);
-            cursor_y += DATA_PRIMARY_SIZE * LINE_HEIGHT_FACTOR;
+            draw_label_value_with_font(scene, x, cursor_y, label, &count.to_string(), w, font_data, scale);
+            cursor_y += data_primary_size * LINE_HEIGHT_FACTOR;
         }
-        cursor_y += SECTION_SPACING - DATA_PRIMARY_SIZE * LINE_HEIGHT_FACTOR;
+        cursor_y += SECTION_SPACING - data_primary_size * LINE_HEIGHT_FACTOR;
     }
 
     // --- Activity section ---
     if cursor_y + 80.0 < y + h {
-        cursor_y = draw_section_header_with_font(scene, x, cursor_y, w, "Activity (24h)", font_data);
+        cursor_y = draw_section_header_with_font(scene, x, cursor_y, w, "Activity (24h)", font_data, scale);
 
         let activity = &state.conversation_activity;
-        draw_label_value_with_font(scene, x, cursor_y, "Received", &activity.messages_received_24h.to_string(), w, font_data);
-        cursor_y += DATA_PRIMARY_SIZE * LINE_HEIGHT_FACTOR;
-        draw_label_value_with_font(scene, x, cursor_y, "Replied", &activity.replies_sent_24h.to_string(), w, font_data);
+        draw_label_value_with_font(scene, x, cursor_y, "Received", &activity.messages_received_24h.to_string(), w, font_data, scale);
+        cursor_y += data_primary_size * LINE_HEIGHT_FACTOR;
+        draw_label_value_with_font(scene, x, cursor_y, "Replied", &activity.replies_sent_24h.to_string(), w, font_data, scale);
         cursor_y += SECTION_SPACING;
     }
 
     // --- Health section ---
     if cursor_y + 80.0 < y + h {
-        cursor_y = draw_section_header_with_font(scene, x, cursor_y, w, "Health", font_data);
+        cursor_y = draw_section_header_with_font(scene, x, cursor_y, w, "Health", font_data, scale);
 
         let health = &state.health;
         let hb_status = match health.heartbeat_age_seconds {
@@ -394,25 +410,25 @@ fn draw_instance_panel(
             Some(age) => format!("stale ({}s)", age),
             None => "unknown".to_string(),
         };
-        draw_label_value_with_font(scene, x, cursor_y, "Heartbeat", &hb_status, w, font_data);
-        cursor_y += DATA_PRIMARY_SIZE * LINE_HEIGHT_FACTOR;
+        draw_label_value_with_font(scene, x, cursor_y, "Heartbeat", &hb_status, w, font_data, scale);
+        cursor_y += data_primary_size * LINE_HEIGHT_FACTOR;
 
         let bot_status = if health.telegram_bot_running { "running" } else { "stopped" };
-        draw_label_value_with_font(scene, x, cursor_y, "Telegram Bot", bot_status, w, font_data);
+        draw_label_value_with_font(scene, x, cursor_y, "Telegram Bot", bot_status, w, font_data, scale);
         cursor_y += SECTION_SPACING;
     }
 
     // --- Agents section ---
     if cursor_y + 60.0 < y + h {
-        cursor_y = draw_section_header_with_font(scene, x, cursor_y, w, "Agents", font_data);
+        cursor_y = draw_section_header_with_font(scene, x, cursor_y, w, "Agents", font_data, scale);
 
         let agents = &state.subagent_list.agents;
         if agents.is_empty() {
-            draw_text_with_font(scene, x, cursor_y, "No agents running", TEXT_ANNOTATION, DATA_SECONDARY_SIZE, font_data);
-            cursor_y += DATA_SECONDARY_SIZE * LINE_HEIGHT_FACTOR;
+            draw_text_with_font(scene, x, cursor_y, "No agents running", TEXT_ANNOTATION, data_secondary_size, font_data);
+            cursor_y += data_secondary_size * LINE_HEIGHT_FACTOR;
         } else {
             for agent in agents.iter().take(4) {
-                if cursor_y + DATA_SECONDARY_SIZE * LINE_HEIGHT_FACTOR > y + h {
+                if cursor_y + data_secondary_size * LINE_HEIGHT_FACTOR > y + h {
                     break;
                 }
                 // Description
@@ -421,7 +437,7 @@ fn draw_instance_panel(
                 } else {
                     agent.description.clone()
                 };
-                draw_text_with_font(scene, x, cursor_y, &desc, TEXT_PRIMARY, DATA_SECONDARY_SIZE, font_data);
+                draw_text_with_font(scene, x, cursor_y, &desc, TEXT_PRIMARY, data_secondary_size, font_data);
 
                 // Elapsed time and stats on the right
                 let elapsed_str = match agent.elapsed_seconds {
@@ -439,39 +455,39 @@ fn draw_instance_panel(
                     format!("{} | {}", elapsed_str, turns_str)
                 };
                 let stats_w = stats_str.len() as f64 * 10.0;
-                draw_text_with_font(scene, (x + w - stats_w).max(x + 20.0), cursor_y, &stats_str, TEXT_ANNOTATION, ANNOTATION_SIZE, font_data);
-                cursor_y += DATA_SECONDARY_SIZE * LINE_HEIGHT_FACTOR;
+                draw_text_with_font(scene, (x + w - stats_w).max(x + 20.0), cursor_y, &stats_str, TEXT_ANNOTATION, annotation_size, font_data);
+                cursor_y += data_secondary_size * LINE_HEIGHT_FACTOR;
             }
             if agents.len() > 4 {
-                draw_text_with_font(scene, x, cursor_y, &format!("+{} more", agents.len() - 4), TEXT_ANNOTATION, ANNOTATION_SIZE, font_data);
-                cursor_y += ANNOTATION_SIZE * LINE_HEIGHT_FACTOR;
+                draw_text_with_font(scene, x, cursor_y, &format!("+{} more", agents.len() - 4), TEXT_ANNOTATION, annotation_size, font_data);
+                cursor_y += annotation_size * LINE_HEIGHT_FACTOR;
             }
         }
-        cursor_y += SECTION_SPACING - DATA_SECONDARY_SIZE * LINE_HEIGHT_FACTOR;
+        cursor_y += SECTION_SPACING - data_secondary_size * LINE_HEIGHT_FACTOR;
     }
 
     // --- Memory section ---
     if cursor_y + 60.0 < y + h {
-        cursor_y = draw_section_header_with_font(scene, x, cursor_y, w, "Memory", font_data);
+        cursor_y = draw_section_header_with_font(scene, x, cursor_y, w, "Memory", font_data, scale);
 
         let mem = &state.memory;
-        draw_label_value_with_font(scene, x, cursor_y, "Events", &mem.total_events.to_string(), w, font_data);
-        cursor_y += DATA_PRIMARY_SIZE * LINE_HEIGHT_FACTOR;
+        draw_label_value_with_font(scene, x, cursor_y, "Events", &mem.total_events.to_string(), w, font_data, scale);
+        cursor_y += data_primary_size * LINE_HEIGHT_FACTOR;
 
         // Projects list
-        if !mem.projects.is_empty() && cursor_y + DATA_SECONDARY_SIZE * LINE_HEIGHT_FACTOR < y + h {
+        if !mem.projects.is_empty() && cursor_y + data_secondary_size * LINE_HEIGHT_FACTOR < y + h {
             let projects_str = if mem.projects.len() > 4 {
                 format!("{} (+{})", mem.projects[..4].join(", "), mem.projects.len() - 4)
             } else {
                 mem.projects.join(", ")
             };
-            draw_label_value_with_font(scene, x, cursor_y, "Projects", &projects_str, w, font_data);
-            cursor_y += DATA_PRIMARY_SIZE * LINE_HEIGHT_FACTOR;
+            draw_label_value_with_font(scene, x, cursor_y, "Projects", &projects_str, w, font_data, scale);
+            cursor_y += data_primary_size * LINE_HEIGHT_FACTOR;
         }
 
         // Recent events
         for event in mem.recent_events.iter().take(4) {
-            if cursor_y + DATA_SECONDARY_SIZE * LINE_HEIGHT_FACTOR > y + h {
+            if cursor_y + data_secondary_size * LINE_HEIGHT_FACTOR > y + h {
                 break;
             }
             let type_tag = match event.event_type.as_str() {
@@ -488,12 +504,12 @@ fn draw_instance_panel(
                 event.content.clone()
             };
             let line = format!("{} {}", type_tag, snippet);
-            draw_text_with_font(scene, x, cursor_y, &line, TEXT_ANNOTATION, DATA_SECONDARY_SIZE, font_data);
-            cursor_y += DATA_SECONDARY_SIZE * LINE_HEIGHT_FACTOR;
+            draw_text_with_font(scene, x, cursor_y, &line, TEXT_ANNOTATION, data_secondary_size, font_data);
+            cursor_y += data_secondary_size * LINE_HEIGHT_FACTOR;
         }
 
         // Last consolidation
-        if cursor_y + DATA_SECONDARY_SIZE * LINE_HEIGHT_FACTOR < y + h {
+        if cursor_y + data_secondary_size * LINE_HEIGHT_FACTOR < y + h {
             let consol_str = match &mem.consolidations.last_consolidation_at {
                 Some(ts) => {
                     let short = if ts.len() > 16 { &ts[..16] } else { ts.as_str() };
@@ -501,7 +517,7 @@ fn draw_instance_panel(
                 }
                 None => "Last consolidation: never".to_string(),
             };
-            draw_text_with_font(scene, x, cursor_y, &consol_str, TEXT_ANNOTATION, ANNOTATION_SIZE, font_data);
+            draw_text_with_font(scene, x, cursor_y, &consol_str, TEXT_ANNOTATION, annotation_size, font_data);
         }
     }
 }
@@ -743,9 +759,10 @@ pub fn draw_text_pub(scene: &mut Scene, x: f64, y: f64, text: &str, color: Color
 /// Draw a section header: section title text with a thin line underneath.
 ///
 /// Returns the y position below the header where content should start.
-fn draw_section_header_with_font(scene: &mut Scene, x: f64, y: f64, w: f64, title: &str, font_data: Option<&FontData>) -> f64 {
+fn draw_section_header_with_font(scene: &mut Scene, x: f64, y: f64, w: f64, title: &str, font_data: Option<&FontData>, scale: f64) -> f64 {
+    let section_size = SECTION_SIZE * scale;
     // Section title text
-    draw_text_with_font(scene, x, y, title, TEXT_SECTION, SECTION_SIZE, font_data);
+    draw_text_with_font(scene, x, y, title, TEXT_SECTION, section_size, font_data);
 
     // Thin horizontal rule underneath
     let rule_y = y + 6.0;
@@ -753,14 +770,16 @@ fn draw_section_header_with_font(scene: &mut Scene, x: f64, y: f64, w: f64, titl
     scene.fill(Fill::NonZero, Affine::IDENTITY, RULE_COLOR, None, &rule_rect);
 
     // Return the y position for content below
-    y + SECTION_SIZE * LINE_HEIGHT_FACTOR + 4.0
+    y + section_size * LINE_HEIGHT_FACTOR + 4.0
 }
 
 /// Draw a label: value pair. Label in secondary weight, value right-aligned in primary weight.
-fn draw_label_value_with_font(scene: &mut Scene, x: f64, y: f64, label: &str, value: &str, w: f64, font_data: Option<&FontData>) {
-    draw_text_with_font(scene, x, y, label, TEXT_SECONDARY, DATA_SECONDARY_SIZE, font_data);
-    let value_width = value.len() as f64 * 12.0;
-    draw_text_with_font(scene, (x + w - value_width).max(x + 100.0), y, value, TEXT_PRIMARY, DATA_PRIMARY_SIZE, font_data);
+fn draw_label_value_with_font(scene: &mut Scene, x: f64, y: f64, label: &str, value: &str, w: f64, font_data: Option<&FontData>, scale: f64) {
+    let data_secondary_size = DATA_SECONDARY_SIZE * scale;
+    let data_primary_size = DATA_PRIMARY_SIZE * scale;
+    draw_text_with_font(scene, x, y, label, TEXT_SECONDARY, data_secondary_size, font_data);
+    let value_width = value.len() as f64 * (12.0 * scale);
+    draw_text_with_font(scene, (x + w - value_width).max(x + 100.0), y, value, TEXT_PRIMARY, data_primary_size, font_data);
 }
 
 // --- Splash quote rendering ---
@@ -1261,7 +1280,7 @@ mod tests {
         assert_eq!(components[0], 0.0, "TEXT_SECONDARY red should be 0.0");
         assert_eq!(components[1], 0.0, "TEXT_SECONDARY green should be 0.0");
         assert_eq!(components[2], 0.0, "TEXT_SECONDARY blue should be 0.0");
-        assert!((components[3] - 0.50).abs() < 0.01, "TEXT_SECONDARY alpha should be ~0.50");
+        assert!((components[3] - 0.85).abs() < 0.01, "TEXT_SECONDARY alpha should be ~0.85");
     }
 
     // --- Splash animation tests ---

@@ -38,6 +38,7 @@ mod design_repl;
 mod info_screen;
 mod logging;
 mod pane_tree;
+mod paths;
 #[allow(dead_code)]
 mod protocol;
 mod state_machine;
@@ -872,7 +873,7 @@ impl ApplicationHandler for App {
                 }
             }
 
-            // Cmd+C / Ctrl+C: copy selected text (non-terminal screens).
+            // Cmd+C: copy selected text (all screens).
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -882,11 +883,18 @@ impl ApplicationHandler for App {
                     },
                 ..
             } if (c.as_str() == "c" || c.as_str() == "C")
-                && (self.modifiers.state().super_key()
-                    || self.modifiers.state().control_key())
-                && self.current_screen != ScreenIndex::Terminal =>
+                && self.modifiers.state().super_key() =>
             {
-                self.copy_selection_to_clipboard();
+                if self.current_screen == ScreenIndex::Terminal {
+                    // Copy from terminal selection.
+                    if let Some(tree) = &self.pane_tree {
+                        if let Some(term) = tree.focused() {
+                            term.copy_selection();
+                        }
+                    }
+                } else {
+                    self.copy_selection_to_clipboard();
+                }
             }
 
             // 'R' key: reserved.
@@ -903,7 +911,7 @@ impl ApplicationHandler for App {
                 && self.current_screen == ScreenIndex::Dashboard => {}
 
             // ----------------------------------------------------------------
-            // Mouse: text selection (dashboard screen only)
+            // Mouse: text selection
             // ----------------------------------------------------------------
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_pos = position;
@@ -914,6 +922,12 @@ impl ApplicationHandler for App {
                     for region in &mut self.selectable_regions {
                         region.handle_mouse_drag(x, y, parley_ctx);
                     }
+                } else if self.current_screen == ScreenIndex::Terminal {
+                    if let Some(tree) = &mut self.pane_tree {
+                        if let Some(term) = tree.focused_mut() {
+                            term.mouse_drag(position.x, position.y, 0.0, 0.0);
+                        }
+                    }
                 }
             }
 
@@ -921,7 +935,9 @@ impl ApplicationHandler for App {
                 state: btn_state,
                 button: MouseButton::Left,
                 ..
-            } if self.is_dashboard() && self.current_screen == ScreenIndex::Dashboard => {
+            } if self.current_screen == ScreenIndex::Dashboard
+                && self.is_dashboard() =>
+            {
                 let x = self.cursor_pos.x;
                 let y = self.cursor_pos.y;
                 match btn_state {
@@ -936,6 +952,31 @@ impl ApplicationHandler for App {
                     ElementState::Released => {
                         for region in &mut self.selectable_regions {
                             region.handle_mouse_release();
+                        }
+                    }
+                }
+            }
+
+            WindowEvent::MouseInput {
+                state: btn_state,
+                button: MouseButton::Left,
+                ..
+            } if self.current_screen == ScreenIndex::Terminal => {
+                let x = self.cursor_pos.x;
+                let y = self.cursor_pos.y;
+                match btn_state {
+                    ElementState::Pressed => {
+                        if let Some(tree) = &mut self.pane_tree {
+                            if let Some(term) = tree.focused_mut() {
+                                term.mouse_press(x, y, 0.0, 0.0);
+                            }
+                        }
+                    }
+                    ElementState::Released => {
+                        if let Some(tree) = &mut self.pane_tree {
+                            if let Some(term) = tree.focused_mut() {
+                                term.mouse_release();
+                            }
                         }
                     }
                 }
@@ -1211,6 +1252,18 @@ fn main() -> Result<()> {
     let rt_handle = runtime.handle().clone();
 
     info!("bisque-computer v{}", env!("CARGO_PKG_VERSION"));
+
+    // Ensure application directory structure exists.
+    match paths::BisquePaths::resolve() {
+        Some(bp) => {
+            if let Err(e) = bp.ensure() {
+                warn!("Failed to create app directories: {e}");
+            } else {
+                info!("App directories ready: {}", bp.data.display());
+            }
+        }
+        None => warn!("Could not resolve HOME — app directories not created"),
+    }
 
     let explicit_endpoints =
         args.endpoints.len() != 1 || args.endpoints[0] != "ws://localhost:9100";
