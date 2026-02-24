@@ -151,6 +151,10 @@ struct Args {
     /// Disable voice input
     #[arg(long)]
     no_voice: bool,
+
+    /// Use Docker-isolated Claude Code containers for terminal panes
+    #[arg(long)]
+    docker: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -641,7 +645,7 @@ impl ApplicationHandler for App {
                 }
             }
 
-            // Cmd+= — increase font size
+            // Cmd+= — increase text size (all screens)
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -650,18 +654,22 @@ impl ApplicationHandler for App {
                         ..
                     },
                 ..
-            } if self.current_screen == ScreenIndex::Terminal
-                && self.modifiers.state().super_key()
+            } if self.modifiers.state().super_key()
                 && (c.as_str() == "=" || c.as_str() == "+") =>
             {
-                if let Some(tree) = &mut self.pane_tree {
-                    if let Some(term) = tree.focused_mut() {
-                        term.increase_font_size();
+                if let Ok(mut tokens) = self.tokens.write() {
+                    tokens.type_scale.base = (tokens.type_scale.base + 2.0).min(72.0);
+                }
+                if self.current_screen == ScreenIndex::Terminal {
+                    if let Some(tree) = &mut self.pane_tree {
+                        if let Some(term) = tree.focused_mut() {
+                            term.increase_font_size();
+                        }
                     }
                 }
             }
 
-            // Cmd+- — decrease font size
+            // Cmd+- — decrease text size (all screens)
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -670,18 +678,22 @@ impl ApplicationHandler for App {
                         ..
                     },
                 ..
-            } if self.current_screen == ScreenIndex::Terminal
-                && self.modifiers.state().super_key()
+            } if self.modifiers.state().super_key()
                 && (c.as_str() == "-" || c.as_str() == "_") =>
             {
-                if let Some(tree) = &mut self.pane_tree {
-                    if let Some(term) = tree.focused_mut() {
-                        term.decrease_font_size();
+                if let Ok(mut tokens) = self.tokens.write() {
+                    tokens.type_scale.base = (tokens.type_scale.base - 2.0).max(8.0);
+                }
+                if self.current_screen == ScreenIndex::Terminal {
+                    if let Some(tree) = &mut self.pane_tree {
+                        if let Some(term) = tree.focused_mut() {
+                            term.decrease_font_size();
+                        }
                     }
                 }
             }
 
-            // Cmd+0 — reset font size to default
+            // Cmd+0 — reset text size to default (all screens)
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -690,13 +702,17 @@ impl ApplicationHandler for App {
                         ..
                     },
                 ..
-            } if self.current_screen == ScreenIndex::Terminal
-                && self.modifiers.state().super_key()
+            } if self.modifiers.state().super_key()
                 && c.as_str() == "0" =>
             {
-                if let Some(tree) = &mut self.pane_tree {
-                    if let Some(term) = tree.focused_mut() {
-                        term.reset_font_size();
+                if let Ok(mut tokens) = self.tokens.write() {
+                    tokens.type_scale.base = 18.0;
+                }
+                if self.current_screen == ScreenIndex::Terminal {
+                    if let Some(tree) = &mut self.pane_tree {
+                        if let Some(term) = tree.focused_mut() {
+                            term.reset_font_size();
+                        }
                     }
                 }
             }
@@ -1145,11 +1161,13 @@ impl ApplicationHandler for App {
                     window_arc.request_redraw();
                 } else {
                     // Schedule cursor blink wakeup via WaitUntil.
+                    // Do NOT call request_redraw() here — about_to_wait() will
+                    // request the redraw when the timer fires, avoiding a tight
+                    // render loop that pegs the CPU.
                     let blink_ms = self.tokens.read().unwrap().animation.cursor_blink_ms;
                     let next_blink = self.last_blink
                         + std::time::Duration::from_millis(blink_ms);
                     event_loop.set_control_flow(ControlFlow::WaitUntil(next_blink));
-                    window_arc.request_redraw();
                 }
             }
 
@@ -1264,13 +1282,19 @@ fn main() -> Result<()> {
         initialized.into()
     };
 
-    // Spawn terminal pane tree with a local PTY shell.
-    // Use a reasonable default size; will be resized when window is available.
-    let pane_tree = PaneTree::new(1280.0, 800.0);
-    if pane_tree.is_some() {
-        info!("Terminal: spawned PTY-backed terminal (Cascadia Code embedded)");
+    // Spawn terminal pane tree. Use Docker backend when --docker is set,
+    // otherwise fall back to a local PTY shell.
+    let pane_tree = if args.docker {
+        info!("Terminal: using Docker backend");
+        PaneTree::with_backend(1280.0, 800.0, pane_tree::TerminalBackend::Docker)
     } else {
-        warn!("Terminal: failed to spawn PTY — terminal screen will show placeholder");
+        info!("Terminal: using local PTY backend");
+        PaneTree::new(1280.0, 800.0)
+    };
+    if pane_tree.is_some() {
+        info!("Terminal: pane tree spawned successfully");
+    } else {
+        warn!("Terminal: failed to spawn terminal — screen will show placeholder");
     }
 
     // TODO(layer-3): Wire token watcher into App

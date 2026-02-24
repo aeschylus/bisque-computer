@@ -668,7 +668,7 @@ fn named_color_fallback(named: NamedColor, is_fg: bool) -> Color {
         NamedColor::Magenta => Color::new([0.67, 0.11, 0.80, 1.0]),
         NamedColor::Cyan => Color::new([0.11, 0.69, 0.80, 1.0]),
         NamedColor::White => Color::new([0.75, 0.75, 0.75, 1.0]),
-        NamedColor::BrightBlack => Color::new([0.25, 0.25, 0.25, 1.0]),
+        NamedColor::BrightBlack => Color::new([0.10, 0.12, 0.13, 1.0]),
         NamedColor::BrightRed => Color::new([0.94, 0.30, 0.30, 1.0]),
         NamedColor::BrightGreen => Color::new([0.30, 0.87, 0.30, 1.0]),
         NamedColor::BrightYellow => Color::new([0.94, 0.94, 0.20, 1.0]),

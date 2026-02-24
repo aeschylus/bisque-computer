@@ -2,9 +2,7 @@
 //!
 //! Provides iTerm2-style pane splitting, closing, and focus cycling.
 //! Each leaf node owns a `TerminalPane` backed by either a local PTY
-//! or a sandboxed process via macOS `sandbox-exec`.
-
-use std::path::PathBuf;
+//! or a Docker container running Claude Code.
 
 use tracing::{info, warn};
 use vello::kurbo::{Affine, Rect};
@@ -13,42 +11,69 @@ use vello::Scene;
 
 use crate::terminal::TerminalPane;
 
-/// The sandbox profile embedded in the binary at compile time.
-const SANDBOX_PROFILE: &str = include_str!("../sandbox/claude-sandbox.sb");
+/// The Dockerfile embedded in the binary at compile time.
+const DOCKERFILE: &str = include_str!("../docker/Dockerfile");
+
+/// Local image name built from the embedded Dockerfile.
+const DOCKER_IMAGE: &str = "bisque-claude-code";
 
 /// Selects how new terminal panes are created.
 #[derive(Clone)]
 pub enum TerminalBackend {
     /// Local PTY shell (existing behavior).
     Local,
-    /// Sandboxed process via macOS sandbox-exec.
-    Sandboxed {
-        project_dir: PathBuf,
-        profile_path: PathBuf,
-    },
+    /// Docker container running Claude Code (fully isolated, no mounts).
+    Docker,
 }
 
-impl TerminalBackend {
-    /// Create a `Sandboxed` backend for the given project directory.
-    ///
-    /// Writes the embedded sandbox profile to a temp file and returns the backend.
-    /// Returns `Local` as a fallback if the temp file cannot be created.
-    pub fn sandboxed(project_dir: PathBuf) -> Self {
-        let profile_path = std::env::temp_dir().join("bisque-claude-sandbox.sb");
-        match std::fs::write(&profile_path, SANDBOX_PROFILE) {
-            Ok(()) => {
-                info!(
-                    project_dir = %project_dir.display(),
-                    profile = %profile_path.display(),
-                    "Sandbox profile written"
-                );
-                Self::Sandboxed { project_dir, profile_path }
-            }
-            Err(e) => {
-                warn!("Failed to write sandbox profile to {}: {} — falling back to local PTY",
-                    profile_path.display(), e);
-                Self::Local
-            }
+/// Ensure the Docker image exists locally, building from the embedded
+/// Dockerfile if necessary. Returns `true` if the image is available.
+fn ensure_docker_image() -> bool {
+    // Check if image already exists.
+    let check = std::process::Command::new("docker")
+        .args(["image", "inspect", DOCKER_IMAGE])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    match check {
+        Ok(status) if status.success() => {
+            info!(image = DOCKER_IMAGE, "Docker image already exists");
+            return true;
+        }
+        _ => {
+            info!(image = DOCKER_IMAGE, "Docker image not found — building");
+        }
+    }
+
+    // Write Dockerfile to a temp directory and build.
+    let build_dir = std::env::temp_dir().join("bisque-docker-build");
+    if let Err(e) = std::fs::create_dir_all(&build_dir) {
+        warn!("Failed to create Docker build dir: {}", e);
+        return false;
+    }
+    if let Err(e) = std::fs::write(build_dir.join("Dockerfile"), DOCKERFILE) {
+        warn!("Failed to write Dockerfile: {}", e);
+        return false;
+    }
+
+    let build = std::process::Command::new("docker")
+        .args(["build", "-t", DOCKER_IMAGE, "."])
+        .current_dir(&build_dir)
+        .status();
+
+    match build {
+        Ok(status) if status.success() => {
+            info!(image = DOCKER_IMAGE, "Docker image built successfully");
+            true
+        }
+        Ok(status) => {
+            warn!(image = DOCKER_IMAGE, code = ?status.code(), "Docker build failed");
+            false
+        }
+        Err(e) => {
+            warn!("Failed to run docker build: {}", e);
+            false
         }
     }
 }
@@ -449,43 +474,33 @@ fn spawn_pane_for_backend(
 ) -> Option<TerminalPane> {
     match backend {
         TerminalBackend::Local => TerminalPane::spawn(width, height),
-        TerminalBackend::Sandboxed { project_dir, profile_path } => {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-            let tmpdir = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
-            let home_npm = format!("{}/.npm", home);
-            let home_config = format!("{}/.config", home);
-            let project_str = project_dir.to_string_lossy().to_string();
-            let profile_str = profile_path.to_string_lossy().to_string();
+        TerminalBackend::Docker => {
+            if !ensure_docker_image() {
+                warn!("Docker image unavailable — falling back to local PTY");
+                return TerminalPane::spawn(width, height);
+            }
 
-            let d_project = format!("PROJECT_DIR={}", project_str);
-            let d_tmpdir = format!("TMPDIR={}", tmpdir);
-            let d_home = format!("HOME={}", home);
-            let d_npm = format!("HOME_NPM={}", home_npm);
-            let d_config = format!("HOME_CONFIG={}", home_config);
+            info!(image = DOCKER_IMAGE, "Spawning Docker container for Claude Code");
 
-            // Spawn a login shell inside the sandbox that execs claude.
-            // This ensures PATH, env, and shell profile are properly set up.
-            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
-            let exec_cmd = format!(
-                "cd {} && exec claude --dangerously-skip-permissions",
-                shell_escape(&project_str),
-            );
+            let api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
+            let mut args: Vec<&str> = vec!["run", "-it", "--rm"];
 
-            let args: Vec<&str> = vec![
-                "-D", &d_project,
-                "-D", &d_tmpdir,
-                "-D", &d_home,
-                "-D", &d_npm,
-                "-D", &d_config,
-                "-f", &profile_str,
-                &shell,
-                "-l", "-c", &exec_cmd,
-            ];
+            // Pass ANTHROPIC_API_KEY into the container so Claude
+            // boots past the interactive sign-in.
+            let env_flag;
+            if !api_key.is_empty() {
+                env_flag = format!("ANTHROPIC_API_KEY={}", api_key);
+                args.extend_from_slice(&["-e", &env_flag]);
+            } else {
+                warn!("ANTHROPIC_API_KEY not set — Claude will prompt for auth inside the container");
+            }
+
+            args.extend_from_slice(&[DOCKER_IMAGE, "--dangerously-skip-permissions"]);
 
             TerminalPane::spawn_command(
                 width,
                 height,
-                "sandbox-exec",
+                "docker",
                 &args,
                 &[],
             )
@@ -538,7 +553,3 @@ fn draw_focus_border(scene: &mut Scene, x: f64, y: f64, w: f64, h: f64) {
     scene.fill(Fill::NonZero, Affine::IDENTITY, FOCUS_BORDER_COLOR, None, &Rect::new(x + w - b, y, x + w, y + h));
 }
 
-/// Escape a string for use in a shell command.
-fn shell_escape(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
