@@ -25,6 +25,11 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Download whisper model
+        run: |
+          curl -L -o ggml-base.en.bin \
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin"
+
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 
@@ -44,6 +49,9 @@ jobs:
           cp "target/${{ matrix.target }}/release/bisque-computer" \
              "${APP}/Contents/MacOS/bisque-computer"
 
+          # Copy sandbox profile into the bundle
+          cp sandbox/claude-sandbox.sb "${APP}/Contents/Resources/claude-sandbox.sb"
+
           # Create Info.plist
           /usr/libexec/PlistBuddy -c "Clear dict" "${APP}/Contents/Info.plist"
           /usr/libexec/PlistBuddy -c "Add :CFBundleName string 'Bisque Computer'" "${APP}/Contents/Info.plist"
@@ -56,6 +64,9 @@ jobs:
           /usr/libexec/PlistBuddy -c "Add :CFBundleInfoDictionaryVersion string '6.0'" "${APP}/Contents/Info.plist"
           /usr/libexec/PlistBuddy -c "Add :NSHighResolutionCapable bool true" "${APP}/Contents/Info.plist"
           /usr/libexec/PlistBuddy -c "Add :NSSupportsAutomaticGraphicsSwitching bool true" "${APP}/Contents/Info.plist"
+
+          # Bundle whisper model
+          cp ggml-base.en.bin "${APP}/Contents/Resources/ggml-base.en.bin"
 
           # Create PkgInfo
           echo -n "APPL????" > "${APP}/Contents/PkgInfo"

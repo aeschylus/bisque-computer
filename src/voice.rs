@@ -1,46 +1,70 @@
 //! Voice input module for Shift+Enter push-to-talk.
 //!
-//! Provides audio capture via cpal (CoreAudio on macOS), WAV encoding via hound,
-//! and transcription via whisper.cpp's HTTP server sidecar.
-//!
-//! Design: pure functions for WAV encoding and transcription; side-effectful
-//! operations (stream start/stop, HTTP call) are isolated at the boundaries.
+//! Provides audio capture via cpal (CoreAudio on macOS) and in-process
+//! transcription via whisper-rs (whisper.cpp bindings).
 
 use anyhow::{Context, Result, anyhow};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, SampleRate, StreamConfig};
-use std::io::Cursor;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
+use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 /// Configuration for the voice input subsystem.
 #[derive(Debug, Clone)]
 pub struct VoiceConfig {
     /// Whether voice input is enabled at all.
     pub enabled: bool,
-    /// Path to the whisper-cli binary.
-    pub whisper_cli: String,
-    /// Path to the whisper model file.
+    /// Path to the whisper GGML model file.
     pub whisper_model: String,
-    /// Hostname or IP of the whisper.cpp HTTP server (default: "localhost").
-    /// Set to the Lobster server host so the Mac client can reach it remotely.
-    pub whisper_host: String,
-    /// Port for the whisper.cpp HTTP server sidecar.
-    pub whisper_port: u16,
 }
 
 impl Default for VoiceConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            whisper_cli: "/home/admin/lobster-workspace/whisper.cpp/build/bin/whisper-cli"
-                .to_string(),
-            whisper_model: "/home/admin/lobster-workspace/whisper.cpp/models/ggml-small.bin"
-                .to_string(),
-            whisper_host: "localhost".to_string(),
-            whisper_port: 8178,
+            whisper_model: resolve_model_path(),
         }
     }
+}
+
+/// Resolve the whisper model path.
+///
+/// Checks (in order):
+/// 1. Inside the .app bundle: `<exe>/../Resources/ggml-base.en.bin`
+/// 2. The build-time path baked in by build.rs (works for `cargo run`)
+///
+/// Panics if no model is found — the app cannot function without it.
+pub fn resolve_model_path() -> String {
+    let model_name = "ggml-base.en.bin";
+
+    // Check .app bundle first (distributed builds).
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(macos_dir) = exe.parent() {
+            let resources = macos_dir.join("../Resources").join(model_name);
+            if resources.exists() {
+                return resources.to_string_lossy().to_string();
+            }
+        }
+    }
+
+    // Fall back to the path baked in at compile time by build.rs.
+    let build_path = env!("WHISPER_MODEL_PATH");
+    if std::path::Path::new(build_path).exists() {
+        return build_path.to_string();
+    }
+
+    panic!(
+        "Whisper model not found. Expected in .app bundle Resources or at build path: {}",
+        build_path
+    );
+}
+
+/// Load or create a WhisperContext from the given model path.
+pub fn load_whisper_context(model_path: &str) -> Result<WhisperContext> {
+    WhisperContext::new_with_params(model_path, WhisperContextParameters::default())
+        .map_err(|e| anyhow!("Failed to load whisper model '{}': {:?}", model_path, e))
 }
 
 /// Live recording state — held while Shift+Enter is depressed.
@@ -75,8 +99,6 @@ pub enum VoiceUiState {
 /// Start a cpal input stream, accumulating f32 samples in a shared buffer.
 ///
 /// Returns a `RecordingState` that keeps the stream alive until dropped.
-/// The caller stops recording by dropping the returned value (or calling
-/// `stop_and_encode`).
 pub fn start_recording() -> Result<RecordingState> {
     let host = cpal::default_host();
 
@@ -103,8 +125,6 @@ pub fn start_recording() -> Result<RecordingState> {
     let buffer_clone = Arc::clone(&buffer);
     let active_clone = Arc::clone(&active);
 
-    // Build the input stream based on the device's native sample format,
-    // always converting to f32 for uniform downstream processing.
     let stream = match supported_config.sample_format() {
         SampleFormat::F32 => build_f32_stream(&device, &stream_config, buffer_clone, active_clone),
         SampleFormat::I16 => build_i16_stream(&device, &stream_config, buffer_clone, active_clone),
@@ -190,18 +210,17 @@ fn build_u16_stream(
 }
 
 // ---------------------------------------------------------------------------
-// WAV encoding (pure function — no side effects)
+// Audio preparation (pure functions)
 // ---------------------------------------------------------------------------
 
-/// Encode accumulated f32 PCM samples into an in-memory WAV byte vector.
+/// Prepare raw captured audio for whisper: mix to mono, resample to 16kHz.
 ///
-/// Whisper expects 16 kHz mono 16-bit PCM. If the source has a different
-/// sample rate or multiple channels, we downsample and mix down here.
-pub fn encode_to_wav(
+/// Returns f32 samples ready to pass directly to whisper-rs `full()`.
+pub fn prepare_audio_for_whisper(
     samples: &[f32],
     source_sample_rate: u32,
     channels: u16,
-) -> Result<Vec<u8>> {
+) -> Vec<f32> {
     // Mix down to mono by averaging channels.
     let mono: Vec<f32> = if channels == 1 {
         samples.to_vec()
@@ -214,40 +233,14 @@ pub fn encode_to_wav(
 
     // Resample to 16 kHz using linear interpolation if needed.
     let target_rate: u32 = 16_000;
-    let resampled: Vec<f32> = if source_sample_rate == target_rate {
+    if source_sample_rate == target_rate {
         mono
     } else {
         resample_linear(&mono, source_sample_rate, target_rate)
-    };
-
-    // Convert f32 [-1.0, 1.0] → i16
-    let pcm_i16: Vec<i16> = resampled
-        .iter()
-        .map(|&s| (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
-        .collect();
-
-    let spec = hound::WavSpec {
-        channels: 1,
-        sample_rate: target_rate,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
-    };
-
-    let mut cursor = Cursor::new(Vec::new());
-    let mut writer = hound::WavWriter::new(&mut cursor, spec)
-        .context("Failed to create WAV writer")?;
-
-    for sample in &pcm_i16 {
-        writer.write_sample(*sample).context("Failed to write WAV sample")?;
     }
-    writer.finalize().context("Failed to finalize WAV")?;
-
-    Ok(cursor.into_inner())
 }
 
 /// Linear interpolation resampler: converts `input` at `from_rate` Hz to `to_rate` Hz.
-///
-/// Pure function — no side effects.
 fn resample_linear(input: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
     if input.is_empty() {
         return Vec::new();
@@ -267,7 +260,7 @@ fn resample_linear(input: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
 }
 
 // ---------------------------------------------------------------------------
-// Transcription
+// Transcription (in-process via whisper-rs)
 // ---------------------------------------------------------------------------
 
 /// Transcription result returned from the whisper backend.
@@ -276,149 +269,50 @@ pub struct TranscriptionResult {
     pub text: String,
 }
 
-/// Call the whisper.cpp HTTP server to transcribe a WAV byte blob.
+/// Transcribe f32 PCM audio (16kHz mono) using a pre-loaded WhisperContext.
 ///
-/// Sends a multipart POST to `http://{host}:{port}/inference`.
-/// Returns the trimmed transcription text on success.
-pub async fn transcribe_via_server(
-    wav_bytes: Vec<u8>,
-    host: &str,
-    port: u16,
+/// This is a blocking, CPU-bound operation — call from `spawn_blocking`.
+pub fn transcribe_local(
+    ctx: &WhisperContext,
+    audio: &[f32],
 ) -> Result<TranscriptionResult> {
-    let url = format!("http://{}:{}/inference", host, port);
+    let mut state = ctx.create_state().map_err(|e| anyhow!("whisper state: {:?}", e))?;
 
-    let part = reqwest::multipart::Part::bytes(wav_bytes)
-        .file_name("audio.wav")
-        .mime_str("audio/wav")?;
+    let mut params = FullParams::new(SamplingStrategy::BeamSearch { beam_size: 5, patience: -1.0 });
+    params.set_print_special(false);
+    params.set_print_progress(false);
+    params.set_print_realtime(false);
+    params.set_print_timestamps(false);
+    params.set_language(Some("en"));
+    params.set_suppress_blank(true);
+    params.set_suppress_nst(true);
 
-    let form = reqwest::multipart::Form::new()
-        .part("file", part)
-        .text("response-format", "json");
+    state
+        .full(params, audio)
+        .map_err(|e| anyhow!("whisper inference failed: {:?}", e))?;
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
-
-    let response = client
-        .post(&url)
-        .multipart(form)
-        .send()
-        .await
-        .context("Failed to reach whisper.cpp server. Is it running?")?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(anyhow!("Whisper server returned {}: {}", status, body));
-    }
-
-    let json: serde_json::Value = response
-        .json()
-        .await
-        .context("Failed to parse whisper response JSON")?;
-
-    // whisper.cpp server returns {"text": "...", ...}
-    let text = json["text"]
-        .as_str()
-        .unwrap_or("")
-        .trim()
-        .to_string();
-
-    Ok(TranscriptionResult { text })
-}
-
-/// Transcribe WAV bytes using whisper-cli as a subprocess.
-///
-/// Writes WAV to a temp file, invokes whisper-cli, parses stdout.
-/// This is the fallback path when the HTTP server is not running.
-pub async fn transcribe_via_cli(
-    wav_bytes: Vec<u8>,
-    whisper_cli: &str,
-    whisper_model: &str,
-) -> Result<TranscriptionResult> {
-    use std::io::Write;
-
-    // Write WAV to a temp file
-    let tmp_path = std::env::temp_dir().join("bisque_voice_input.wav");
-    {
-        let mut f = std::fs::File::create(&tmp_path)
-            .context("Failed to create temp WAV file")?;
-        f.write_all(&wav_bytes)
-            .context("Failed to write temp WAV file")?;
-    }
-
-    let output = tokio::process::Command::new(whisper_cli)
-        .args([
-            "--model",
-            whisper_model,
-            "--file",
-            tmp_path.to_str().unwrap(),
-            "--no-timestamps",
-            "--output-txt",
-            "-",
-        ])
-        .output()
-        .await
-        .context("Failed to run whisper-cli")?;
-
-    // Clean up temp file (best-effort)
-    let _ = std::fs::remove_file(&tmp_path);
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!("whisper-cli failed: {}", stderr));
-    }
-
-    let raw = String::from_utf8_lossy(&output.stdout);
-    // whisper-cli outputs lines like "[00:00:00.000 --> 00:00:05.000]  text here"
-    // With --no-timestamps, it may still include brackets on some builds.
-    // Strip any leading timestamp brackets if present.
-    let text = raw
-        .lines()
-        .filter_map(|line| {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                None
-            } else if trimmed.starts_with('[') {
-                // Strip "[HH:MM:SS.mmm --> HH:MM:SS.mmm]  " prefix
-                trimmed.find(']').map(|i| trimmed[i + 1..].trim().to_string())
-            } else {
-                Some(trimmed.to_string())
+    let num_segments = state.full_n_segments();
+    let mut text = String::new();
+    for i in 0..num_segments {
+        if let Some(segment) = state.get_segment(i) {
+            if let Ok(s) = segment.to_str_lossy() {
+                text.push_str(&s);
             }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-        .trim()
-        .to_string();
-
-    Ok(TranscriptionResult { text })
-}
-
-/// Attempt transcription: try HTTP server first, fall back to CLI subprocess.
-pub async fn transcribe(wav_bytes: Vec<u8>, config: &VoiceConfig) -> Result<TranscriptionResult> {
-    match transcribe_via_server(wav_bytes.clone(), &config.whisper_host, config.whisper_port).await {
-        Ok(result) => Ok(result),
-        Err(server_err) => {
-            eprintln!(
-                "whisper HTTP server unavailable ({}), falling back to CLI",
-                server_err
-            );
-            transcribe_via_cli(wav_bytes, &config.whisper_cli, &config.whisper_model).await
         }
     }
+
+    Ok(TranscriptionResult {
+        text: text.trim().to_string(),
+    })
 }
 
 // ---------------------------------------------------------------------------
-// Stop and encode helper
+// Stop and collect helper
 // ---------------------------------------------------------------------------
 
 /// Signal the recording to stop and extract the accumulated buffer.
-///
-/// Marks the stream as inactive and collects the PCM samples. The stream
-/// itself is kept alive by `RecordingState`; drop it after calling this.
 pub fn stop_and_collect(state: &RecordingState) -> Vec<f32> {
     state.active.store(false, Ordering::Relaxed);
-    // Give the stream callback one more tick to flush
     std::thread::sleep(std::time::Duration::from_millis(20));
     state.buffer.lock().unwrap().clone()
 }

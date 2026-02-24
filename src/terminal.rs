@@ -1,20 +1,20 @@
-//! PTY-backed terminal emulator for the bisque-computer terminal screen.
+//! Backend-agnostic terminal emulator for the bisque-computer terminal screen.
 //!
 //! Provides `TerminalPane` — a struct that:
-//!   - Spawns a shell in a PTY via `portable_pty`
-//!   - Runs a reader thread that feeds PTY output to `alacritty_terminal::Term`
+//!   - Connects to a byte-stream backend (local PTY or VM serial console)
+//!   - Feeds output to `alacritty_terminal::Term` via a tokio mpsc channel
 //!   - Exposes `render_into_scene()` to draw the cell grid using vello
-//!   - Routes keyboard input from winit to the PTY writer
+//!   - Routes keyboard input from winit to the backend writer
 //!
 //! The Cascadia Code font is embedded in the binary via `include_bytes!()`.
 //!
 //! Architecture (data flows):
 //!
 //! ```text
-//! [bash process]
-//!       │ PTY master (read)
+//! [backend: local PTY / VM serial console]
+//!       │ byte stream (read)
 //!       ▼
-//! [reader thread] ──mpsc──► [main thread: drain_output()]
+//! [reader thread/task] ──mpsc──► [main thread: drain_output()]
 //!                                          │
 //!                                          ▼
 //!                              alacritty_terminal::Term
@@ -25,7 +25,7 @@
 //!
 //! Key input:
 //! ```text
-//! winit KeyEvent ──► key_event_to_pty_bytes() ──► PTY writer (sync write)
+//! winit KeyEvent ──► key_event_to_pty_bytes() ──► backend writer (sync write)
 //! ```
 
 use std::io::Write;
@@ -45,21 +45,45 @@ use vello::kurbo::{Affine, Rect};
 use vello::peniko::{Color, Fill, FontData};
 use winit::keyboard::{Key, NamedKey};
 
-use crate::design::DesignTokens;
-
-// Cascadia Code embedded in the binary (SIL OFL license).
+// Cascadia Code embedded as fallback (SIL OFL license).
 // Attribution: Copyright (c) Microsoft Corporation
 const CASCADIA_CODE_BYTES: &[u8] = include_bytes!("../assets/CascadiaCode.ttf");
 
-/// Terminal background color (close to a standard dark terminal).
-const TERM_BG: Color = Color::new([0.08, 0.08, 0.10, 1.0]);
-/// Default foreground: near-white.
-const TERM_FG: Color = Color::new([0.85, 0.85, 0.90, 1.0]);
-/// Cursor color.
-const TERM_CURSOR: Color = Color::new([0.85, 0.65, 0.20, 0.85]);
+/// Terminal background: bisque beige (matches app style guide).
+const TERM_BG: Color = Color::new([1.0, 0.894, 0.769, 1.0]);
+/// Default foreground: black (matches app style guide).
+const TERM_FG: Color = Color::new([0.0, 0.0, 0.0, 1.0]);
+/// Cursor color: dark brown, visible on bisque.
+const TERM_CURSOR: Color = Color::new([0.40, 0.26, 0.13, 0.85]);
+
+/// Horizontal padding (one cell width on each side).
+const TERM_PAD_CELLS: usize = 1;
+
+/// Monaco font stack paths (code/mono font per style guide).
+const MONO_FONT_PATHS: &[&str] = &[
+    "/System/Library/Fonts/Monaco.ttf",
+    "/System/Library/Fonts/Supplemental/Menlo.ttc",
+    "/Library/Fonts/Monaco.ttf",
+];
+
+/// Load Monaco (or fallback mono font) from system, falling back to embedded Cascadia Code.
+fn load_terminal_font() -> FontData {
+    for path in MONO_FONT_PATHS {
+        if let Ok(data) = std::fs::read(path) {
+            return FontData::new(data.into(), 0);
+        }
+    }
+    FontData::new(CASCADIA_CODE_BYTES.to_vec().into(), 0)
+}
 
 /// Default font size for the terminal in pixels.
-const FONT_SIZE: f32 = 14.0;
+const DEFAULT_FONT_SIZE: f32 = 28.0;
+/// Minimum font size.
+const MIN_FONT_SIZE: f32 = 8.0;
+/// Maximum font size.
+const MAX_FONT_SIZE: f32 = 72.0;
+/// Font size step per Cmd+=/Cmd+-.
+const FONT_SIZE_STEP: f32 = 2.0;
 
 // --- TermSize helper --------------------------------------------------------
 
@@ -93,9 +117,35 @@ struct TermEventListener;
 
 impl EventListener for TermEventListener {}
 
+// --- PtyResize trait ---------------------------------------------------------
+
+/// Trait for resizing the remote terminal, abstracted over backends.
+///
+/// Implemented by `LocalPtyResize` (portable_pty) and `VmPtyResize` (Virtualization.framework).
+pub trait PtyResize: Send {
+    fn resize(&self, rows: u16, cols: u16, pixel_width: u16, pixel_height: u16);
+}
+
+/// Adapter for local PTY resize via `portable_pty::MasterPty`.
+struct LocalPtyResize(Box<dyn portable_pty::MasterPty + Send>);
+
+impl PtyResize for LocalPtyResize {
+    fn resize(&self, rows: u16, cols: u16, pixel_width: u16, pixel_height: u16) {
+        let _ = self.0.resize(PtySize {
+            rows,
+            cols,
+            pixel_width,
+            pixel_height,
+        });
+    }
+}
+
 // --- TerminalPane -----------------------------------------------------------
 
-/// A PTY-backed terminal pane that renders into a vello `Scene`.
+/// A terminal pane that renders into a vello `Scene`.
+///
+/// Backend-agnostic: can be driven by a local PTY (`spawn()`) or by
+/// pre-wired byte streams from a VM serial console (`from_streams()`).
 pub struct TerminalPane {
     /// The terminal state machine (cell grid + cursor + SGR state).
     /// Wrapped in Arc<Mutex<>> so the reader thread can send output to it.
@@ -108,18 +158,25 @@ pub struct TerminalPane {
     /// Buffered PTY output bytes from the reader thread.
     rx: tokio_mpsc::UnboundedReceiver<Vec<u8>>,
 
-    /// Write handle to the PTY master (sends input to the shell).
+    /// Write handle to the backend (sends input to the shell/VM).
     pty_writer: Box<dyn Write + Send>,
 
-    /// Master PTY handle (kept alive for resize).
-    pty_master: Box<dyn portable_pty::MasterPty + Send>,
+    /// Resize handle (backend-agnostic).
+    pty_resize: Box<dyn PtyResize + Send>,
 
     /// Cascadia Code font data.
     font: FontData,
 
-    /// Computed cell dimensions (pixels) at current FONT_SIZE.
+    /// Current font size in pixels.
+    pub font_size: f32,
+
+    /// Computed cell dimensions (pixels) at current font_size.
     pub cell_width: f32,
     pub cell_height: f32,
+
+    /// Current pixel dimensions (for resize after font change).
+    pixel_width: f64,
+    pixel_height: f64,
 
     /// Current terminal dimensions.
     pub cols: usize,
@@ -135,11 +192,13 @@ impl TerminalPane {
     /// `width` and `height` are the pixel dimensions of the terminal area.
     /// Returns `None` if PTY creation or shell spawn fails.
     pub fn spawn(width: f64, height: f64) -> Option<Self> {
-        // Build font and compute cell dimensions.
-        let font_data = FontData::new(CASCADIA_CODE_BYTES.to_vec().into(), 0);
-        let (cell_width, cell_height) = compute_cell_size(&font_data, FONT_SIZE);
+        // Build font (Monaco preferred, Cascadia Code fallback) and compute cell dimensions.
+        let font_data = load_terminal_font();
+        let (cell_width, cell_height) = compute_cell_size(&font_data, DEFAULT_FONT_SIZE);
 
-        let cols = ((width / cell_width as f64).floor() as usize).max(2);
+        let pad_px = cell_width as f64 * TERM_PAD_CELLS as f64;
+        let usable_width = (width - pad_px * 2.0).max(0.0);
+        let cols = ((usable_width / cell_width as f64).floor() as usize).max(2);
         let rows = ((height / cell_height as f64).floor() as usize).max(1);
 
         // Open a PTY pair.
@@ -159,6 +218,10 @@ impl TerminalPane {
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
         cmd.env("TERM_PROGRAM", "bisque-computer");
+        // Remove Claude Code env vars so `claude` can be launched inside the PTY
+        // without it thinking it's already running inside Claude Code.
+        cmd.env_remove("CLAUDECODE");
+        cmd.env_remove("CLAUDE_CODE_ENTRYPOINT");
 
         let _child = pair.slave.spawn_command(cmd).ok()?;
         // `_child` is kept to ensure the process isn't reaped prematurely,
@@ -196,19 +259,144 @@ impl TerminalPane {
             processor: Processor::new(),
             rx,
             pty_writer: writer,
-            pty_master: pair.master,
+            pty_resize: Box::new(LocalPtyResize(pair.master)),
             font: font_data,
+            font_size: DEFAULT_FONT_SIZE,
             cell_width,
             cell_height,
+            pixel_width: width,
+            pixel_height: height,
             cols,
             rows,
             cursor_visible: true,
         })
     }
 
-    /// Returns the embedded Cascadia Code font data (useful for shared font loading).
-    pub fn cascadia_font_data() -> FontData {
-        FontData::new(CASCADIA_CODE_BYTES.to_vec().into(), 0)
+    /// Spawn a new terminal pane running a custom command (instead of $SHELL).
+    ///
+    /// Used by the sandboxed backend to run `sandbox-exec ... claude`.
+    /// `width` and `height` are the pixel dimensions of the terminal area.
+    pub fn spawn_command(
+        width: f64,
+        height: f64,
+        cmd: &str,
+        args: &[&str],
+        env: &[(&str, &str)],
+    ) -> Option<Self> {
+        let font_data = load_terminal_font();
+        let (cell_width, cell_height) = compute_cell_size(&font_data, DEFAULT_FONT_SIZE);
+
+        let pad_px = cell_width as f64 * TERM_PAD_CELLS as f64;
+        let usable_width = (width - pad_px * 2.0).max(0.0);
+        let cols = ((usable_width / cell_width as f64).floor() as usize).max(2);
+        let rows = ((height / cell_height as f64).floor() as usize).max(1);
+
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows: rows as u16,
+                cols: cols as u16,
+                pixel_width: width as u16,
+                pixel_height: height as u16,
+            })
+            .ok()?;
+
+        let mut command = CommandBuilder::new(cmd);
+        for arg in args {
+            command.arg(*arg);
+        }
+        for (k, v) in env {
+            command.env(*k, *v);
+        }
+        command.env("TERM", "xterm-256color");
+        command.env("COLORTERM", "truecolor");
+        command.env("TERM_PROGRAM", "bisque-computer");
+        command.env_remove("CLAUDECODE");
+        command.env_remove("CLAUDE_CODE_ENTRYPOINT");
+
+        let _child = pair.slave.spawn_command(command).ok()?;
+
+        let reader = pair.master.try_clone_reader().ok()?;
+        let writer = pair.master.take_writer().ok()?;
+
+        let (tx, rx) = tokio_mpsc::unbounded_channel::<Vec<u8>>();
+        {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let mut reader = reader;
+                let mut buf = [0u8; 4096];
+                loop {
+                    match std::io::Read::read(&mut reader, &mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            let _ = tx.send(buf[..n].to_vec());
+                        }
+                    }
+                }
+            });
+        }
+
+        let size = TermSize::new(cols, rows);
+        let term = Term::new(Config::default(), &size, TermEventListener);
+        let term = Arc::new(Mutex::new(term));
+
+        Some(Self {
+            term,
+            processor: Processor::new(),
+            rx,
+            pty_writer: writer,
+            pty_resize: Box::new(LocalPtyResize(pair.master)),
+            font: font_data,
+            font_size: DEFAULT_FONT_SIZE,
+            cell_width,
+            cell_height,
+            pixel_width: width,
+            pixel_height: height,
+            cols,
+            rows,
+            cursor_visible: true,
+        })
+    }
+
+    /// Create a terminal pane from pre-wired I/O streams.
+    ///
+    /// Used by the VM backend: the caller provides the mpsc receiver (output from
+    /// the VM), a writer (input to the VM), and a resize handle.
+    pub fn from_streams(
+        rx: tokio_mpsc::UnboundedReceiver<Vec<u8>>,
+        writer: Box<dyn Write + Send>,
+        resizer: Box<dyn PtyResize + Send>,
+        cols: usize,
+        rows: usize,
+    ) -> Self {
+        let font_data = load_terminal_font();
+        let (cell_width, cell_height) = compute_cell_size(&font_data, DEFAULT_FONT_SIZE);
+
+        let size = TermSize::new(cols, rows);
+        let term = Term::new(Config::default(), &size, TermEventListener);
+        let term = Arc::new(Mutex::new(term));
+
+        Self {
+            term,
+            processor: Processor::new(),
+            rx,
+            pty_writer: writer,
+            pty_resize: resizer,
+            font: font_data,
+            font_size: DEFAULT_FONT_SIZE,
+            cell_width,
+            cell_height,
+            pixel_width: cols as f64 * cell_width as f64,
+            pixel_height: rows as f64 * cell_height as f64,
+            cols,
+            rows,
+            cursor_visible: true,
+        }
+    }
+
+    /// Returns the terminal mono font data (Monaco preferred, Cascadia Code fallback).
+    pub fn mono_font_data() -> FontData {
+        load_terminal_font()
     }
 
     /// Drain all pending PTY output bytes from the channel and feed them to the
@@ -233,7 +421,12 @@ impl TerminalPane {
     ///
     /// Called when the window is resized or the terminal screen becomes active.
     pub fn resize(&mut self, width: f64, height: f64) {
-        let new_cols = ((width / self.cell_width as f64).floor() as usize).max(2);
+        self.pixel_width = width;
+        self.pixel_height = height;
+
+        let pad_px = self.cell_width as f64 * TERM_PAD_CELLS as f64;
+        let usable_width = (width - pad_px * 2.0).max(0.0);
+        let new_cols = ((usable_width / self.cell_width as f64).floor() as usize).max(2);
         let new_rows = ((height / self.cell_height as f64).floor() as usize).max(1);
 
         if new_cols == self.cols && new_rows == self.rows {
@@ -243,13 +436,13 @@ impl TerminalPane {
         self.cols = new_cols;
         self.rows = new_rows;
 
-        // Resize the PTY.
-        let _ = self.pty_master.resize(PtySize {
-            rows: new_rows as u16,
-            cols: new_cols as u16,
-            pixel_width: width as u16,
-            pixel_height: height as u16,
-        });
+        // Resize the backend (PTY or VM serial console).
+        self.pty_resize.resize(
+            new_rows as u16,
+            new_cols as u16,
+            width as u16,
+            height as u16,
+        );
 
         // Resize the terminal grid.
         let new_size = TermSize::new(new_cols, new_rows);
@@ -271,11 +464,40 @@ impl TerminalPane {
         true
     }
 
+    /// Increase font size by one step (Cmd+=).
+    pub fn increase_font_size(&mut self) {
+        self.set_font_size(self.font_size + FONT_SIZE_STEP);
+    }
+
+    /// Decrease font size by one step (Cmd+-).
+    pub fn decrease_font_size(&mut self) {
+        self.set_font_size(self.font_size - FONT_SIZE_STEP);
+    }
+
+    /// Reset font size to default (Cmd+0).
+    pub fn reset_font_size(&mut self) {
+        self.set_font_size(DEFAULT_FONT_SIZE);
+    }
+
+    /// Set font size, recompute cell dimensions, and resize the terminal grid.
+    fn set_font_size(&mut self, size: f32) {
+        let size = size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
+        if (size - self.font_size).abs() < 0.01 {
+            return;
+        }
+        self.font_size = size;
+        let (cw, ch) = compute_cell_size(&self.font, size);
+        self.cell_width = cw;
+        self.cell_height = ch;
+        // Re-derive cols/rows from stored pixel dimensions and trigger PTY + grid resize.
+        self.resize(self.pixel_width, self.pixel_height);
+    }
+
     /// Render the terminal cell grid into a vello `Scene`.
     ///
     /// `offset_x` and `offset_y` are the top-left pixel position of the terminal
     /// area within the window.
-    pub fn render_into_scene(&self, scene: &mut Scene, offset_x: f64, offset_y: f64, width: f64, height: f64, _tokens: &DesignTokens) {
+    pub fn render_into_scene(&self, scene: &mut Scene, offset_x: f64, offset_y: f64, width: f64, height: f64) {
         // Background fill.
         let bg_rect = Rect::new(offset_x, offset_y, offset_x + width, offset_y + height);
         scene.fill(Fill::NonZero, Affine::IDENTITY, TERM_BG, None, &bg_rect);
@@ -286,6 +508,10 @@ impl TerminalPane {
 
         let cw = self.cell_width as f64;
         let ch = self.cell_height as f64;
+
+        // Horizontal padding (one cell width on each side).
+        let pad_px = cw * TERM_PAD_CELLS as f64;
+        let offset_x = offset_x + pad_px;
 
         // We'll accumulate glyphs for a single draw_glyphs call per color group,
         // but for correctness and simplicity we issue one call per glyph run.
@@ -345,7 +571,7 @@ impl TerminalPane {
         for (color, glyphs) in fg_glyphs {
             scene
                 .draw_glyphs(&self.font)
-                .font_size(FONT_SIZE)
+                .font_size(self.font_size)
                 .brush(&color)
                 .draw(Fill::NonZero, glyphs.into_iter());
         }
@@ -530,11 +756,23 @@ pub fn key_event_to_pty_bytes(key: &Key, ctrl_held: bool) -> Vec<u8> {
             NamedKey::End => b"\x1b[F".to_vec(),
             NamedKey::PageUp => b"\x1b[5~".to_vec(),
             NamedKey::PageDown => b"\x1b[6~".to_vec(),
-            // Function keys F1-F4.
+            // Space (winit may emit space as Named(Space) instead of Character(" ")).
+            NamedKey::Space => vec![b' '],
+            // Insert key.
+            NamedKey::Insert => b"\x1b[2~".to_vec(),
+            // Function keys F1-F12 (standard xterm sequences).
             NamedKey::F1 => b"\x1bOP".to_vec(),
             NamedKey::F2 => b"\x1bOQ".to_vec(),
             NamedKey::F3 => b"\x1bOR".to_vec(),
             NamedKey::F4 => b"\x1bOS".to_vec(),
+            NamedKey::F5 => b"\x1b[15~".to_vec(),
+            NamedKey::F6 => b"\x1b[17~".to_vec(),
+            NamedKey::F7 => b"\x1b[18~".to_vec(),
+            NamedKey::F8 => b"\x1b[19~".to_vec(),
+            NamedKey::F9 => b"\x1b[20~".to_vec(),
+            NamedKey::F10 => b"\x1b[21~".to_vec(),
+            NamedKey::F11 => b"\x1b[23~".to_vec(),
+            NamedKey::F12 => b"\x1b[24~".to_vec(),
             _ => vec![],
         },
         _ => vec![],

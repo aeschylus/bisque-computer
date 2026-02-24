@@ -1,13 +1,14 @@
 //! Dashboard rendering using vello.
 //!
-//! Renders Lobster instance data as a visual dashboard with panels for
-//! system info, message queues, sessions, tasks, and health status.
+//! Renders Lobster instance data as a visual dashboard using typography-first
+//! design principles. No boxes, no panels, no progress bars, no colored badges.
+//! Hierarchy is communicated through font size, opacity, and whitespace.
 //!
-//! Visual theme: bisque beige throughout, black text, doubled text sizes.
+//! Visual theme: bisque beige background, black text at varying opacities.
 //! Fonts: Optima for readable text, Monaco for monospace (font stacks with fallbacks).
 //! On app open: Ulysses splash quote fades in and out.
 
-use vello::kurbo::{Affine, BezPath, Point, Rect, RoundedRect};
+use vello::kurbo::{Affine, Rect};
 use vello::peniko::{Color, Fill, FontData};
 use vello::{Glyph, Scene};
 
@@ -16,54 +17,29 @@ use crate::protocol::{ConnectionStatus, LobsterInstance};
 use crate::voice::VoiceUiState;
 use crate::ws_client::SharedInstances;
 
-// --- Color palette (bisque beige theme) ---
-// CSS bisque = rgb(255, 228, 196) = [1.0, 0.894, 0.769]
+// --- Color palette (typography-only: background + black at varying opacities) ---
 
 const BG_COLOR: Color = Color::new([1.0, 0.894, 0.769, 1.0]);        // CSS bisque background
-const PANEL_BG: Color = Color::new([1.0, 0.922, 0.827, 1.0]);        // lighter bisque panel
-const PANEL_BORDER: Color = Color::new([0.87, 0.72, 0.53, 1.0]);     // warm tan border
-const HEADER_BG: Color = Color::new([0.80, 0.62, 0.40, 1.0]);        // warm bisque-brown header
 const TEXT_PRIMARY: Color = Color::new([0.0, 0.0, 0.0, 1.0]);        // pure black (#000000)
-const TEXT_SECONDARY: Color = Color::new([0.0, 0.0, 0.0, 0.65]);     // black at 65% opacity
-const TEXT_LIGHT: Color = Color::new([0.0, 0.0, 0.0, 1.0]);          // black on header
-const ACCENT_GREEN: Color = Color::new([0.20, 0.65, 0.32, 1.0]);     // healthy green
-const ACCENT_RED: Color = Color::new([0.80, 0.20, 0.18, 1.0]);       // alert red
-const ACCENT_AMBER: Color = Color::new([0.85, 0.60, 0.10, 1.0]);     // warning amber
-const ACCENT_BLUE: Color = Color::new([0.22, 0.46, 0.72, 1.0]);      // info blue
-const BAR_BG: Color = Color::new([0.96, 0.87, 0.75, 1.0]);           // bisque bar background
-const SECTION_BG: Color = Color::new([1.0, 0.91, 0.80, 1.0]);        // bisque section fill
+const TEXT_SECONDARY: Color = Color::new([0.0, 0.0, 0.0, 0.50]);     // black at 50% opacity
+const TEXT_SECTION: Color = Color::new([0.0, 0.0, 0.0, 0.80]);       // black at 80% opacity (section titles)
+const TEXT_ANNOTATION: Color = Color::new([0.0, 0.0, 0.0, 0.40]);    // black at 40% opacity (small annotations)
+const RULE_COLOR: Color = Color::new([0.0, 0.0, 0.0, 0.15]);         // black at 15% opacity (thin rules)
 
-// --- 3D Isometric Colors (bisque-compatible) ---
-const ISO_SESSION_TOP: Color = Color::new([0.82, 0.55, 0.28, 1.0]);    // warm brown top face
-const ISO_SESSION_LEFT: Color = Color::new([0.72, 0.48, 0.22, 1.0]);   // darker left face
-const ISO_SESSION_RIGHT: Color = Color::new([0.90, 0.65, 0.38, 1.0]);  // lighter right face
-const ISO_TASK_PENDING_TOP: Color = Color::new([0.85, 0.60, 0.10, 1.0]);   // amber
-const ISO_TASK_PENDING_LEFT: Color = Color::new([0.72, 0.50, 0.08, 1.0]);
-const ISO_TASK_PENDING_RIGHT: Color = Color::new([0.92, 0.70, 0.18, 1.0]);
-const ISO_TASK_ACTIVE_TOP: Color = Color::new([0.22, 0.58, 0.72, 1.0]);    // blue-ish
-const ISO_TASK_ACTIVE_LEFT: Color = Color::new([0.16, 0.46, 0.60, 1.0]);
-const ISO_TASK_ACTIVE_RIGHT: Color = Color::new([0.30, 0.66, 0.80, 1.0]);
-const ISO_TASK_DONE_TOP: Color = Color::new([0.25, 0.62, 0.35, 1.0]);      // green
-const ISO_TASK_DONE_LEFT: Color = Color::new([0.18, 0.50, 0.26, 1.0]);
-const ISO_TASK_DONE_RIGHT: Color = Color::new([0.32, 0.70, 0.42, 1.0]);
-const ISO_SHADOW: Color = Color::new([0.0, 0.0, 0.0, 0.10]);              // soft shadow
-const ISO_GROUND: Color = Color::new([0.92, 0.82, 0.68, 1.0]);            // ground plane
-const ISO_GRID: Color = Color::new([0.85, 0.73, 0.58, 0.5]);              // ground grid lines
-const ISO_INBOX_TOP: Color = Color::new([0.80, 0.20, 0.18, 1.0]);         // red for inbox
-const ISO_INBOX_LEFT: Color = Color::new([0.65, 0.15, 0.13, 1.0]);
-const ISO_INBOX_RIGHT: Color = Color::new([0.88, 0.28, 0.25, 1.0]);
+// --- Typography design system ---
 
-// --- Layout constants (doubled text sizes) ---
+const TITLE_SIZE: f64 = 44.0;       // Page title
+const SECTION_SIZE: f64 = 18.0;     // Section titles
+const DATA_PRIMARY_SIZE: f64 = 24.0; // Primary data
+const DATA_SECONDARY_SIZE: f64 = 20.0; // Labels, secondary data
+const ANNOTATION_SIZE: f64 = 16.0;  // Small annotations
 
-const MARGIN: f64 = 24.0;
-const PANEL_PADDING: f64 = 16.0;
-const PANEL_GAP: f64 = 16.0;
-const HEADER_HEIGHT: f64 = 72.0;       // taller for 2x text
-const SECTION_HEIGHT: f64 = 48.0;      // taller for 2x text
-const LINE_HEIGHT: f64 = 36.0;         // doubled from 22
-const BAR_HEIGHT: f64 = 20.0;          // slightly taller
-const CORNER_RADIUS: f64 = 8.0;
-const STATUS_DOT_RADIUS: f64 = 8.0;    // slightly larger
+// --- Layout constants ---
+
+const LEFT_MARGIN: f64 = 48.0;
+const SECTION_SPACING: f64 = 32.0;
+const LINE_HEIGHT_FACTOR: f64 = 1.4;
+const RULE_THICKNESS: f64 = 0.5;
 
 // --- Splash quote from James Joyce's Ulysses ---
 
@@ -119,221 +95,182 @@ pub fn render_dashboard(
         return;
     }
 
-    // Title bar
-    let title_rect = Rect::new(0.0, 0.0, width, HEADER_HEIGHT);
-    scene.fill(Fill::NonZero, Affine::IDENTITY, HEADER_BG, None, &title_rect);
-    draw_text_with_font(scene, MARGIN, 50.0, "LOBSTER DASHBOARD", TEXT_LIGHT, 44.0, font_data);
+    // Page title — large Optima text with generous whitespace
+    let title_y = 56.0;
+    draw_text_with_font(scene, LEFT_MARGIN, title_y, "Lobster Dashboard", TEXT_PRIMARY, TITLE_SIZE, font_data);
 
-    // Count connected instances
+    // Connection status as secondary text next to title
     let connected = instances
         .iter()
         .filter(|i| i.status == ConnectionStatus::Connected)
         .count();
     let status_text = format!("{}/{} connected", connected, instances.len());
-    draw_text_with_font(scene, width - 400.0, 50.0, &status_text, TEXT_LIGHT, 28.0, font_data);
+    draw_text_with_font(scene, width - 300.0, title_y, &status_text, TEXT_SECONDARY, DATA_SECONDARY_SIZE, font_data);
 
-    // Voice input hint in header (shown when enabled and idle)
+    // Voice input hint (shown when enabled)
     if voice_enabled {
         let hint = match voice_ui {
-            VoiceUiState::Idle => "  |  Shift+Enter: voice",
-            VoiceUiState::Recording => "  |  Recording...",
-            VoiceUiState::Transcribing => "  |  Transcribing...",
-            VoiceUiState::Done(_) => "  |  Sent",
-            VoiceUiState::Error(_) => "  |  Voice error",
+            VoiceUiState::Idle => "Shift+Enter: voice",
+            VoiceUiState::Recording => "Recording...",
+            VoiceUiState::Transcribing => "Transcribing...",
+            VoiceUiState::Done(_) => "Sent",
+            VoiceUiState::Error(_) => "Voice error",
         };
-        let hint_color = match voice_ui {
-            VoiceUiState::Recording => Color::new([1.0_f32, 0.3, 0.3, 1.0]), // red while live
-            VoiceUiState::Transcribing => Color::new([0.9_f32, 0.75, 0.1, 1.0]), // amber
-            VoiceUiState::Done(_) => Color::new([0.3_f32, 0.8, 0.4, 1.0]),   // green
-            _ => Color::new([1.0_f32, 1.0, 1.0, 0.60]),
+        let hint_opacity = match voice_ui {
+            VoiceUiState::Recording => 0.80_f32,
+            VoiceUiState::Transcribing => 0.60,
+            _ => 0.40,
         };
-        draw_text_with_font(scene, width - 400.0, 72.0, hint, hint_color, 22.0, font_data);
+        let hint_color = Color::new([0.0_f32, 0.0, 0.0, hint_opacity]);
+        draw_text_with_font(scene, width - 300.0, title_y + 28.0, hint, hint_color, ANNOTATION_SIZE, font_data);
     }
 
-    // Layout: panels in a grid with 3D visualization
-    let content_top = HEADER_HEIGHT + MARGIN;
-    let content_width = width - 2.0 * MARGIN;
-    let content_height = height - content_top - MARGIN;
+    // Content area starts below the title
+    let content_top = title_y + 32.0;
+    let content_width = width - LEFT_MARGIN * 2.0;
+    let content_height = height - content_top - LEFT_MARGIN;
 
     let num_instances = instances.len();
 
-    // Check if any instance is connected (for 3D viz)
-    let _any_connected = instances.iter().any(|i| i.status == ConnectionStatus::Connected);
-
     if num_instances == 1 {
-        // Single instance: side-by-side layout -- info panel left, 3D viz right
-        let split = 0.45; // info panel gets 45% width, 3D viz gets 55%
-        let info_w = content_width * split - PANEL_GAP * 0.5;
-        let viz_w = content_width * (1.0 - split) - PANEL_GAP * 0.5;
-
-        draw_instance_panel(scene, MARGIN, content_top, info_w, content_height, &instances[0], font_data);
-        draw_3d_visualization(
-            scene,
-            MARGIN + info_w + PANEL_GAP, content_top,
-            viz_w, content_height,
-            &instances[0], elapsed, font_data,
-        );
+        // Single instance: full width
+        draw_instance_panel(scene, LEFT_MARGIN, content_top, content_width, content_height, &instances[0], font_data);
     } else {
-        // Multiple instances: grid of info panels + 3D viz row at bottom
-        let viz_height = content_height * 0.35;
-        let panels_height = content_height - viz_height - PANEL_GAP;
-
-        let cols = if num_instances <= 1 { 1 } else if num_instances <= 4 { 2 } else { 3 };
+        // Multiple instances: vertical flow or two-column
+        let cols = if num_instances <= 2 { num_instances } else if num_instances <= 4 { 2 } else { 3 };
         let rows = (num_instances + cols - 1) / cols;
+        let col_gap = 48.0;
+        let row_gap = SECTION_SPACING;
 
-        let panel_width = (content_width - (cols as f64 - 1.0) * PANEL_GAP) / cols as f64;
-        let panel_height = (panels_height - (rows as f64 - 1.0) * PANEL_GAP) / rows as f64;
+        let panel_width = (content_width - (cols as f64 - 1.0) * col_gap) / cols as f64;
+        let panel_height = (content_height - (rows as f64 - 1.0) * row_gap) / rows as f64;
 
         for (idx, instance) in instances.iter().enumerate() {
             let col = idx % cols;
             let row = idx / cols;
-            let x = MARGIN + col as f64 * (panel_width + PANEL_GAP);
-            let y = content_top + row as f64 * (panel_height + PANEL_GAP);
+            let x = LEFT_MARGIN + col as f64 * (panel_width + col_gap);
+            let y = content_top + row as f64 * (panel_height + row_gap);
 
             draw_instance_panel(scene, x, y, panel_width, panel_height, instance, font_data);
         }
-
-        // Draw 3D viz panels for all instances along the bottom
-        // (shows demo visualization even when disconnected)
-        let viz_top = content_top + panels_height + PANEL_GAP;
-        let viz_cols = num_instances;
-        let viz_panel_w = (content_width - (viz_cols as f64 - 1.0).max(0.0) * PANEL_GAP) / viz_cols as f64;
-
-        for (idx, instance) in instances.iter().enumerate() {
-            let vx = MARGIN + idx as f64 * (viz_panel_w + PANEL_GAP);
-            draw_3d_visualization(scene, vx, viz_top, viz_panel_w, viz_height, instance, elapsed, font_data);
-        }
     }
 
-    // Voice input overlay — drawn on top of everything else so it's always visible.
-    // Drop the instances lock before drawing the overlay (already dropped at end of scope).
+    // Voice input overlay — drawn on top of everything else
     drop(instances);
-    draw_voice_indicator(scene, width, height, voice_ui, elapsed, font_data);
+    draw_voice_indicator(scene, width, height, voice_ui, font_data);
 }
 
 /// Draw the voice recording / transcribing / result overlay.
 ///
-/// The indicator is anchored to the bottom-right corner. It shows:
-/// - A pulsing red circle while recording.
-/// - An amber "Transcribing..." badge while waiting for whisper.
-/// - A green "Sent" confirmation after the text is dispatched.
-/// - An error message in red on failure.
+/// Pure typography: just text in the bottom-right corner, no badges or pills.
 fn draw_voice_indicator(
     scene: &mut Scene,
     width: f64,
     height: f64,
     voice_ui: &VoiceUiState,
-    elapsed: f64,
     font_data: Option<&FontData>,
 ) {
+    let right_margin = LEFT_MARGIN;
+    let bottom_margin = LEFT_MARGIN;
+
     match voice_ui {
         VoiceUiState::Idle => {} // Nothing to draw
 
         VoiceUiState::Recording => {
-            // Pulsing red circle (mic-on indicator)
-            let pulse = ((elapsed * 4.0).sin() * 0.5 + 0.5) as f32; // 0..1 at 4Hz
-            let radius = 16.0 + 6.0 * pulse as f64;
-            let cx = width - MARGIN - radius;
-            let cy = height - MARGIN - radius;
-
-            // Glow halo
-            let halo_alpha = 0.25 + 0.15 * pulse;
-            let halo_color = Color::new([0.9_f32, 0.1, 0.1, halo_alpha]);
-            draw_circle(scene, cx, cy, radius * 2.0, halo_color);
-
-            // Solid red dot
-            let dot_color = Color::new([0.85_f32, 0.12, 0.10, 1.0]);
-            draw_circle(scene, cx, cy, radius, dot_color);
-
-            // "REC" label
             draw_text_with_font(
                 scene,
-                cx - radius - 60.0,
-                cy + 8.0,
-                "REC",
-                dot_color,
-                28.0,
+                width - right_margin - 180.0,
+                height - bottom_margin,
+                "Recording...",
+                TEXT_PRIMARY,
+                DATA_PRIMARY_SIZE,
                 font_data,
             );
         }
 
         VoiceUiState::Transcribing => {
-            // Amber pill badge: "Transcribing..."
-            let badge_w = 280.0;
-            let badge_h = 44.0;
-            let bx = width - MARGIN - badge_w;
-            let by = height - MARGIN - badge_h;
-            let badge_rect = RoundedRect::new(bx, by, bx + badge_w, by + badge_h, 10.0);
-            let badge_bg = Color::new([0.85_f32, 0.60, 0.10, 0.92]);
-            scene.fill(Fill::NonZero, Affine::IDENTITY, badge_bg, None, &badge_rect);
             draw_text_with_font(
                 scene,
-                bx + 16.0,
-                by + 30.0,
+                width - right_margin - 200.0,
+                height - bottom_margin,
                 "Transcribing...",
-                Color::new([1.0_f32, 1.0, 1.0, 1.0]),
-                24.0,
+                TEXT_SECONDARY,
+                DATA_SECONDARY_SIZE,
                 font_data,
             );
         }
 
         VoiceUiState::Done(text) => {
-            // Green pill badge with truncated transcribed text
-            let max_chars = 40;
-            let display_text: String = if text.len() > max_chars {
-                format!("{}...", &text[..max_chars])
-            } else {
-                text.clone()
-            };
-            let badge_label = format!("Sent: {}", display_text);
-            let badge_w = (badge_label.len() as f64 * 13.0 + 40.0).min(width * 0.6);
-            let badge_h = 44.0;
-            let bx = width - MARGIN - badge_w;
-            let by = height - MARGIN - badge_h;
-            let badge_rect = RoundedRect::new(bx, by, bx + badge_w, by + badge_h, 10.0);
-            let badge_bg = Color::new([0.22_f32, 0.62, 0.30, 0.92]);
-            scene.fill(Fill::NonZero, Affine::IDENTITY, badge_bg, None, &badge_rect);
-            draw_text_with_font(
-                scene,
-                bx + 16.0,
-                by + 30.0,
-                &badge_label,
-                Color::new([1.0_f32, 1.0, 1.0, 1.0]),
-                22.0,
-                font_data,
-            );
+            // Word-wrapped transcribed text in the bottom-right area
+            let font_size = DATA_SECONDARY_SIZE;
+            let char_w = 11.0;
+            let max_w = width * 0.5;
+            let chars_per_line = (max_w / char_w).max(10.0) as usize;
+            let line_height = font_size * LINE_HEIGHT_FACTOR;
+
+            let full_text = format!("Sent: {}", text);
+            let mut lines: Vec<String> = Vec::new();
+            let mut current_line = String::new();
+            for word in full_text.split_whitespace() {
+                if current_line.is_empty() {
+                    current_line = word.to_string();
+                } else if current_line.len() + 1 + word.len() <= chars_per_line {
+                    current_line.push(' ');
+                    current_line.push_str(word);
+                } else {
+                    lines.push(current_line);
+                    current_line = word.to_string();
+                }
+            }
+            if !current_line.is_empty() {
+                lines.push(current_line);
+            }
+            if lines.is_empty() {
+                lines.push(full_text);
+            }
+
+            let num_lines = lines.len();
+            let block_height = num_lines as f64 * line_height;
+            let start_y = height - bottom_margin - block_height + line_height;
+
+            for (i, line) in lines.iter().enumerate() {
+                draw_text_with_font(
+                    scene,
+                    width - right_margin - max_w,
+                    start_y + i as f64 * line_height,
+                    line,
+                    TEXT_SECONDARY,
+                    font_size,
+                    font_data,
+                );
+            }
         }
 
         VoiceUiState::Error(msg) => {
-            // Red pill badge with error summary
             let max_chars = 50;
             let display_msg: String = if msg.len() > max_chars {
                 format!("{}...", &msg[..max_chars])
             } else {
                 msg.clone()
             };
-            let badge_label = format!("Voice error: {}", display_msg);
-            let badge_w = (badge_label.len() as f64 * 12.0 + 40.0).min(width * 0.65);
-            let badge_h = 44.0;
-            let bx = width - MARGIN - badge_w;
-            let by = height - MARGIN - badge_h;
-            let badge_rect = RoundedRect::new(bx, by, bx + badge_w, by + badge_h, 10.0);
-            let badge_bg = Color::new([0.78_f32, 0.15, 0.12, 0.92]);
-            scene.fill(Fill::NonZero, Affine::IDENTITY, badge_bg, None, &badge_rect);
+            let label = format!("Voice error: {}", display_msg);
             draw_text_with_font(
                 scene,
-                bx + 16.0,
-                by + 30.0,
-                &badge_label,
-                Color::new([1.0_f32, 1.0, 1.0, 1.0]),
-                22.0,
+                width - right_margin - 500.0,
+                height - bottom_margin,
+                &label,
+                TEXT_SECONDARY,
+                DATA_SECONDARY_SIZE,
                 font_data,
             );
         }
     }
 }
 
-/// Draw a single Lobster instance panel.
+/// Draw a single Lobster instance using typography-first layout.
+///
+/// No panels, no borders. Just text with hierarchy created through
+/// font size, opacity, and whitespace.
 fn draw_instance_panel(
     scene: &mut Scene,
     x: f64,
@@ -343,178 +280,148 @@ fn draw_instance_panel(
     instance: &LobsterInstance,
     font_data: Option<&FontData>,
 ) {
-    // Panel background with rounded corners
-    let panel_rect = RoundedRect::new(x, y, x + w, y + h, CORNER_RADIUS);
-    scene.fill(Fill::NonZero, Affine::IDENTITY, PANEL_BG, None, &panel_rect);
+    let mut cursor_y = y;
 
-    // Panel border
-    scene.stroke(
-        &vello::kurbo::Stroke::new(1.5),
-        Affine::IDENTITY,
-        PANEL_BORDER,
-        None,
-        &panel_rect,
-    );
-
-    let inner_x = x + PANEL_PADDING;
-    let inner_w = w - 2.0 * PANEL_PADDING;
-    let mut cursor_y = y + PANEL_PADDING;
-
-    // --- Instance header with connection status ---
-    let status_color = match &instance.status {
-        ConnectionStatus::Connected => ACCENT_GREEN,
-        ConnectionStatus::Connecting => ACCENT_AMBER,
-        ConnectionStatus::Disconnected => ACCENT_RED,
-        ConnectionStatus::Error(_) => ACCENT_RED,
-    };
-
-    // Status dot
-    draw_circle(scene, inner_x + STATUS_DOT_RADIUS, cursor_y + 10.0, STATUS_DOT_RADIUS, status_color);
-
-    // Hostname or URL
+    // --- Hostname in large text ---
     let hostname = if instance.status == ConnectionStatus::Connected {
         &instance.state.system.hostname
     } else {
         &instance.url
     };
-    draw_text_with_font(scene, inner_x + 24.0, cursor_y + 20.0, hostname, TEXT_PRIMARY, 32.0, font_data);
+    cursor_y += 36.0;
+    draw_text_with_font(scene, x, cursor_y, hostname, TEXT_PRIMARY, 36.0, font_data);
 
-    // Connection status text
+    // Connection status as small secondary text below
     let status_str = match &instance.status {
         ConnectionStatus::Connected => "connected".to_string(),
         ConnectionStatus::Connecting => "connecting...".to_string(),
         ConnectionStatus::Disconnected => "disconnected".to_string(),
         ConnectionStatus::Error(e) => format!("error: {}", &e[..e.len().min(30)]),
     };
-    draw_text_with_font(scene, inner_x + 24.0, cursor_y + 48.0, &status_str, TEXT_PRIMARY, 22.0, font_data);
-    cursor_y += 60.0;
+    cursor_y += DATA_SECONDARY_SIZE * LINE_HEIGHT_FACTOR;
+    draw_text_with_font(scene, x, cursor_y, &status_str, TEXT_SECONDARY, DATA_SECONDARY_SIZE, font_data);
 
     if instance.status != ConnectionStatus::Connected {
         return;
     }
 
     let state = &instance.state;
+    cursor_y += SECTION_SPACING;
 
     // --- System section ---
-    cursor_y = draw_section_header_with_font(scene, inner_x, cursor_y, inner_w, "SYSTEM", font_data);
+    cursor_y = draw_section_header_with_font(scene, x, cursor_y, w, "System", font_data);
 
     // Uptime
     let uptime_str = format_uptime(state.system.uptime_seconds);
-    draw_label_value_with_font(scene, inner_x, cursor_y, "Uptime", &uptime_str, inner_w, font_data);
-    cursor_y += LINE_HEIGHT;
+    draw_label_value_with_font(scene, x, cursor_y, "Uptime", &uptime_str, w, font_data);
+    cursor_y += DATA_PRIMARY_SIZE * LINE_HEIGHT_FACTOR;
 
-    // CPU bar
-    draw_label_bar_with_font(scene, inner_x, cursor_y, "CPU", state.system.cpu.percent, inner_w, cpu_color(state.system.cpu.percent), font_data);
-    cursor_y += LINE_HEIGHT;
+    // CPU, Memory, Disk as text-only: "CPU  42%"
+    let cpu_str = format!("{:.0}%", state.system.cpu.percent);
+    draw_label_value_with_font(scene, x, cursor_y, "CPU", &cpu_str, w, font_data);
+    cursor_y += DATA_PRIMARY_SIZE * LINE_HEIGHT_FACTOR;
 
-    // Memory bar
-    draw_label_bar_with_font(scene, inner_x, cursor_y, "Memory", state.system.memory.percent, inner_w, mem_color(state.system.memory.percent), font_data);
-    cursor_y += LINE_HEIGHT;
+    let mem_str = format!("{:.0}%", state.system.memory.percent);
+    draw_label_value_with_font(scene, x, cursor_y, "Memory", &mem_str, w, font_data);
+    cursor_y += DATA_PRIMARY_SIZE * LINE_HEIGHT_FACTOR;
 
-    // Disk bar
-    draw_label_bar_with_font(scene, inner_x, cursor_y, "Disk", state.system.disk.percent, inner_w, disk_color(state.system.disk.percent), font_data);
-    cursor_y += LINE_HEIGHT + 4.0;
+    let disk_str = format!("{:.0}%", state.system.disk.percent);
+    draw_label_value_with_font(scene, x, cursor_y, "Disk", &disk_str, w, font_data);
+    cursor_y += SECTION_SPACING;
 
     // --- Sessions section ---
-    cursor_y = draw_section_header_with_font(scene, inner_x, cursor_y, inner_w, "SESSIONS", font_data);
+    cursor_y = draw_section_header_with_font(scene, x, cursor_y, w, "Sessions", font_data);
 
-    // Filter to just actual Claude processes (not wrapper scripts, tmux, etc.)
     let claude_sessions: Vec<_> = state.sessions.iter()
         .filter(|s| s.name == "claude")
         .collect();
     let session_count = claude_sessions.len();
-    draw_label_value_with_font(scene, inner_x, cursor_y, "Active", &format!("{}", session_count), inner_w, font_data);
-    cursor_y += LINE_HEIGHT;
+    draw_label_value_with_font(scene, x, cursor_y, "Active", &format!("{}", session_count), w, font_data);
+    cursor_y += DATA_PRIMARY_SIZE * LINE_HEIGHT_FACTOR;
 
-    // Show memory for each session (up to 3)
-    for (_i, session) in claude_sessions.iter().take(3).enumerate() {
-        let label = format!("  PID {}", session.pid);
+    // Show each session as text
+    for session in claude_sessions.iter().take(3) {
+        let label = format!("PID {}", session.pid);
         let value = format!("{:.0} MB", session.memory_mb);
-        draw_label_value_with_font(scene, inner_x, cursor_y, &label, &value, inner_w, font_data);
-        cursor_y += LINE_HEIGHT;
+        draw_text_with_font(scene, x + 16.0, cursor_y, &label, TEXT_ANNOTATION, DATA_SECONDARY_SIZE, font_data);
+        let value_width = value.len() as f64 * 12.0;
+        draw_text_with_font(scene, (x + w - value_width).max(x + 100.0), cursor_y, &value, TEXT_PRIMARY, DATA_SECONDARY_SIZE, font_data);
+        cursor_y += DATA_SECONDARY_SIZE * LINE_HEIGHT_FACTOR;
     }
     if session_count > 3 {
-        draw_text_with_font(scene, inner_x + 8.0, cursor_y, &format!("  +{} more", session_count - 3), TEXT_PRIMARY, 22.0, font_data);
-        cursor_y += LINE_HEIGHT;
+        draw_text_with_font(scene, x + 16.0, cursor_y, &format!("+{} more", session_count - 3), TEXT_ANNOTATION, ANNOTATION_SIZE, font_data);
+        cursor_y += ANNOTATION_SIZE * LINE_HEIGHT_FACTOR;
     }
-    cursor_y += 4.0;
+    cursor_y += SECTION_SPACING - DATA_SECONDARY_SIZE * LINE_HEIGHT_FACTOR;
 
     // --- Messages section ---
-    cursor_y = draw_section_header_with_font(scene, inner_x, cursor_y, inner_w, "MESSAGES", font_data);
+    if cursor_y + 100.0 < y + h {
+        cursor_y = draw_section_header_with_font(scene, x, cursor_y, w, "Messages", font_data);
 
-    let queues = &state.message_queues;
-    let queue_items = [
-        ("Inbox", queues.inbox.count, if queues.inbox.count > 0 { ACCENT_AMBER } else { ACCENT_GREEN }),
-        ("Processed", queues.processed.count, TEXT_PRIMARY),
-        ("Sent", queues.sent.count, ACCENT_BLUE),
-        ("Failed", queues.failed.count, if queues.failed.count > 0 { ACCENT_RED } else { TEXT_PRIMARY }),
-    ];
+        let queues = &state.message_queues;
+        let queue_items = [
+            ("Inbox", queues.inbox.count),
+            ("Processed", queues.processed.count),
+            ("Sent", queues.sent.count),
+            ("Failed", queues.failed.count),
+        ];
 
-    for (label, count, color) in &queue_items {
-        draw_label_value_colored_with_font(scene, inner_x, cursor_y, label, &count.to_string(), inner_w, *color, font_data);
-        cursor_y += LINE_HEIGHT;
+        for (label, count) in &queue_items {
+            draw_label_value_with_font(scene, x, cursor_y, label, &count.to_string(), w, font_data);
+            cursor_y += DATA_PRIMARY_SIZE * LINE_HEIGHT_FACTOR;
+        }
+        cursor_y += SECTION_SPACING - DATA_PRIMARY_SIZE * LINE_HEIGHT_FACTOR;
     }
-    cursor_y += 4.0;
 
     // --- Activity section ---
-    if cursor_y + 60.0 < y + h {
-        cursor_y = draw_section_header_with_font(scene, inner_x, cursor_y, inner_w, "ACTIVITY (24h)", font_data);
+    if cursor_y + 80.0 < y + h {
+        cursor_y = draw_section_header_with_font(scene, x, cursor_y, w, "Activity (24h)", font_data);
 
         let activity = &state.conversation_activity;
-        draw_label_value_with_font(scene, inner_x, cursor_y, "Received", &activity.messages_received_24h.to_string(), inner_w, font_data);
-        cursor_y += LINE_HEIGHT;
-        draw_label_value_with_font(scene, inner_x, cursor_y, "Replied", &activity.replies_sent_24h.to_string(), inner_w, font_data);
-        cursor_y += LINE_HEIGHT + 4.0;
+        draw_label_value_with_font(scene, x, cursor_y, "Received", &activity.messages_received_24h.to_string(), w, font_data);
+        cursor_y += DATA_PRIMARY_SIZE * LINE_HEIGHT_FACTOR;
+        draw_label_value_with_font(scene, x, cursor_y, "Replied", &activity.replies_sent_24h.to_string(), w, font_data);
+        cursor_y += SECTION_SPACING;
     }
 
     // --- Health section ---
-    if cursor_y + 40.0 < y + h {
-        cursor_y = draw_section_header_with_font(scene, inner_x, cursor_y, inner_w, "HEALTH", font_data);
+    if cursor_y + 80.0 < y + h {
+        cursor_y = draw_section_header_with_font(scene, x, cursor_y, w, "Health", font_data);
 
         let health = &state.health;
         let hb_status = match health.heartbeat_age_seconds {
             Some(age) if age < 300 => format!("{}s ago", age),
-            Some(age) => format!("STALE ({}s)", age),
+            Some(age) => format!("stale ({}s)", age),
             None => "unknown".to_string(),
         };
-        let hb_color = if health.heartbeat_stale { ACCENT_RED } else { ACCENT_GREEN };
-        draw_label_value_colored_with_font(scene, inner_x, cursor_y, "Heartbeat", &hb_status, inner_w, hb_color, font_data);
-        cursor_y += LINE_HEIGHT;
+        draw_label_value_with_font(scene, x, cursor_y, "Heartbeat", &hb_status, w, font_data);
+        cursor_y += DATA_PRIMARY_SIZE * LINE_HEIGHT_FACTOR;
 
         let bot_status = if health.telegram_bot_running { "running" } else { "stopped" };
-        let bot_color = if health.telegram_bot_running { ACCENT_GREEN } else { ACCENT_RED };
-        draw_label_value_colored_with_font(scene, inner_x, cursor_y, "Telegram Bot", bot_status, inner_w, bot_color, font_data);
-        cursor_y += LINE_HEIGHT;
+        draw_label_value_with_font(scene, x, cursor_y, "Telegram Bot", bot_status, w, font_data);
+        cursor_y += SECTION_SPACING;
     }
 
     // --- Agents section ---
-    if cursor_y + 40.0 < y + h {
-        cursor_y = draw_section_header_with_font(scene, inner_x, cursor_y, inner_w, "AGENTS", font_data);
+    if cursor_y + 60.0 < y + h {
+        cursor_y = draw_section_header_with_font(scene, x, cursor_y, w, "Agents", font_data);
 
         let agents = &state.subagent_list.agents;
         if agents.is_empty() {
-            draw_text_with_font(scene, inner_x + 4.0, cursor_y + 24.0, "No agents running", TEXT_SECONDARY, 22.0, font_data);
-            cursor_y += LINE_HEIGHT;
+            draw_text_with_font(scene, x, cursor_y, "No agents running", TEXT_ANNOTATION, DATA_SECONDARY_SIZE, font_data);
+            cursor_y += DATA_SECONDARY_SIZE * LINE_HEIGHT_FACTOR;
         } else {
             for agent in agents.iter().take(4) {
-                if cursor_y + LINE_HEIGHT > y + h {
+                if cursor_y + DATA_SECONDARY_SIZE * LINE_HEIGHT_FACTOR > y + h {
                     break;
                 }
-                // Status dot
-                let dot_color = match agent.status.as_str() {
-                    "running" => ACCENT_GREEN,
-                    "stale" => ACCENT_AMBER,
-                    _ => TEXT_SECONDARY,
-                };
-                draw_circle(scene, inner_x + STATUS_DOT_RADIUS, cursor_y + 18.0, STATUS_DOT_RADIUS * 0.75, dot_color);
-
-                // Description (truncated)
+                // Description
                 let desc = if agent.description.len() > 52 {
                     format!("{}...", &agent.description[..52])
                 } else {
                     agent.description.clone()
                 };
-                draw_text_with_font(scene, inner_x + 20.0, cursor_y + 24.0, &desc, TEXT_PRIMARY, 20.0, font_data);
+                draw_text_with_font(scene, x, cursor_y, &desc, TEXT_PRIMARY, DATA_SECONDARY_SIZE, font_data);
 
                 // Elapsed time and stats on the right
                 let elapsed_str = match agent.elapsed_seconds {
@@ -531,47 +438,40 @@ fn draw_instance_panel(
                 } else {
                     format!("{} | {}", elapsed_str, turns_str)
                 };
-                let stats_w = stats_str.len() as f64 * 12.0;
-                draw_text_with_font(scene, (inner_x + inner_w - stats_w).max(inner_x + 20.0), cursor_y + 24.0, &stats_str, TEXT_SECONDARY, 20.0, font_data);
-                cursor_y += LINE_HEIGHT;
+                let stats_w = stats_str.len() as f64 * 10.0;
+                draw_text_with_font(scene, (x + w - stats_w).max(x + 20.0), cursor_y, &stats_str, TEXT_ANNOTATION, ANNOTATION_SIZE, font_data);
+                cursor_y += DATA_SECONDARY_SIZE * LINE_HEIGHT_FACTOR;
             }
             if agents.len() > 4 {
-                draw_text_with_font(scene, inner_x + 8.0, cursor_y + 24.0, &format!("  +{} more", agents.len() - 4), TEXT_SECONDARY, 20.0, font_data);
-                cursor_y += LINE_HEIGHT;
+                draw_text_with_font(scene, x, cursor_y, &format!("+{} more", agents.len() - 4), TEXT_ANNOTATION, ANNOTATION_SIZE, font_data);
+                cursor_y += ANNOTATION_SIZE * LINE_HEIGHT_FACTOR;
             }
         }
-        cursor_y += 4.0;
+        cursor_y += SECTION_SPACING - DATA_SECONDARY_SIZE * LINE_HEIGHT_FACTOR;
     }
 
     // --- Memory section ---
-    if cursor_y + 40.0 < y + h {
-        cursor_y = draw_section_header_with_font(scene, inner_x, cursor_y, inner_w, "MEMORY", font_data);
+    if cursor_y + 60.0 < y + h {
+        cursor_y = draw_section_header_with_font(scene, x, cursor_y, w, "Memory", font_data);
 
         let mem = &state.memory;
-
-        // Summary line
-        let summary = format!(
-            "{} events, {} unconsolidated",
-            mem.total_events, mem.unconsolidated_count
-        );
-        draw_label_value_with_font(scene, inner_x, cursor_y, "Events", &mem.total_events.to_string(), inner_w, font_data);
-        let _ = summary; // used for readability above
-        cursor_y += LINE_HEIGHT;
+        draw_label_value_with_font(scene, x, cursor_y, "Events", &mem.total_events.to_string(), w, font_data);
+        cursor_y += DATA_PRIMARY_SIZE * LINE_HEIGHT_FACTOR;
 
         // Projects list
-        if !mem.projects.is_empty() && cursor_y + LINE_HEIGHT < y + h {
+        if !mem.projects.is_empty() && cursor_y + DATA_SECONDARY_SIZE * LINE_HEIGHT_FACTOR < y + h {
             let projects_str = if mem.projects.len() > 4 {
                 format!("{} (+{})", mem.projects[..4].join(", "), mem.projects.len() - 4)
             } else {
                 mem.projects.join(", ")
             };
-            draw_label_value_with_font(scene, inner_x, cursor_y, "Projects", &projects_str, inner_w, font_data);
-            cursor_y += LINE_HEIGHT;
+            draw_label_value_with_font(scene, x, cursor_y, "Projects", &projects_str, w, font_data);
+            cursor_y += DATA_PRIMARY_SIZE * LINE_HEIGHT_FACTOR;
         }
 
-        // Recent events (up to 4)
+        // Recent events
         for event in mem.recent_events.iter().take(4) {
-            if cursor_y + LINE_HEIGHT > y + h {
+            if cursor_y + DATA_SECONDARY_SIZE * LINE_HEIGHT_FACTOR > y + h {
                 break;
             }
             let type_tag = match event.event_type.as_str() {
@@ -588,24 +488,21 @@ fn draw_instance_panel(
                 event.content.clone()
             };
             let line = format!("{} {}", type_tag, snippet);
-            draw_text_with_font(scene, inner_x + 4.0, cursor_y + 22.0, &line, TEXT_SECONDARY, 20.0, font_data);
-            cursor_y += LINE_HEIGHT;
+            draw_text_with_font(scene, x, cursor_y, &line, TEXT_ANNOTATION, DATA_SECONDARY_SIZE, font_data);
+            cursor_y += DATA_SECONDARY_SIZE * LINE_HEIGHT_FACTOR;
         }
 
         // Last consolidation
-        if cursor_y + LINE_HEIGHT < y + h {
+        if cursor_y + DATA_SECONDARY_SIZE * LINE_HEIGHT_FACTOR < y + h {
             let consol_str = match &mem.consolidations.last_consolidation_at {
                 Some(ts) => {
-                    // Show just date+time portion for brevity (first 16 chars of ISO)
                     let short = if ts.len() > 16 { &ts[..16] } else { ts.as_str() };
-                    format!("Last: {}", short)
+                    format!("Last consolidation: {}", short)
                 }
-                None => "Last: never".to_string(),
+                None => "Last consolidation: never".to_string(),
             };
-            draw_text_with_font(scene, inner_x + 4.0, cursor_y + 22.0, &consol_str, TEXT_SECONDARY, 20.0, font_data);
-            cursor_y += LINE_HEIGHT;
+            draw_text_with_font(scene, x, cursor_y, &consol_str, TEXT_ANNOTATION, ANNOTATION_SIZE, font_data);
         }
-        let _ = cursor_y;
     }
 }
 
@@ -657,6 +554,7 @@ fn draw_text_bitmap(scene: &mut Scene, x: f64, y: f64, text: &str, color: Color,
 
 /// Legacy draw_text wrapper -- used when no font context is available.
 /// Kept for backward compatibility in helpers that don't have font access.
+#[allow(dead_code)]
 fn draw_text(scene: &mut Scene, x: f64, y: f64, text: &str, color: Color, size: f64) {
     draw_text_bitmap(scene, x, y, text, color, size);
 }
@@ -842,100 +740,27 @@ pub fn draw_text_pub(scene: &mut Scene, x: f64, y: f64, text: &str, color: Color
     draw_text_with_font(scene, x, y, text, color, size, font_data);
 }
 
-/// Draw a filled circle.
-fn draw_circle(scene: &mut Scene, cx: f64, cy: f64, r: f64, color: Color) {
-    let circle = vello::kurbo::Circle::new(Point::new(cx, cy), r);
-    scene.fill(Fill::NonZero, Affine::IDENTITY, color, None, &circle);
-}
-
-/// Draw a section header bar (bitmap font only).
-#[allow(dead_code)]
-fn draw_section_header(scene: &mut Scene, x: f64, y: f64, w: f64, title: &str) -> f64 {
-    let rect = RoundedRect::new(x, y, x + w, y + SECTION_HEIGHT - 4.0, 4.0);
-    scene.fill(Fill::NonZero, Affine::IDENTITY, SECTION_BG, None, &rect);
-    draw_text(scene, x + 8.0, y + SECTION_HEIGHT - 16.0, title, TEXT_PRIMARY, 22.0);
-    y + SECTION_HEIGHT
-}
-
-/// Draw a section header bar with font support.
+/// Draw a section header: section title text with a thin line underneath.
+///
+/// Returns the y position below the header where content should start.
 fn draw_section_header_with_font(scene: &mut Scene, x: f64, y: f64, w: f64, title: &str, font_data: Option<&FontData>) -> f64 {
-    let rect = RoundedRect::new(x, y, x + w, y + SECTION_HEIGHT - 4.0, 4.0);
-    scene.fill(Fill::NonZero, Affine::IDENTITY, SECTION_BG, None, &rect);
-    draw_text_with_font(scene, x + 8.0, y + SECTION_HEIGHT - 16.0, title, TEXT_PRIMARY, 22.0, font_data);
-    y + SECTION_HEIGHT
+    // Section title text
+    draw_text_with_font(scene, x, y, title, TEXT_SECTION, SECTION_SIZE, font_data);
+
+    // Thin horizontal rule underneath
+    let rule_y = y + 6.0;
+    let rule_rect = Rect::new(x, rule_y, x + w, rule_y + RULE_THICKNESS);
+    scene.fill(Fill::NonZero, Affine::IDENTITY, RULE_COLOR, None, &rule_rect);
+
+    // Return the y position for content below
+    y + SECTION_SIZE * LINE_HEIGHT_FACTOR + 4.0
 }
 
-/// Draw a label: value pair (bitmap font only).
-#[allow(dead_code)]
-fn draw_label_value(scene: &mut Scene, x: f64, y: f64, label: &str, value: &str, _w: f64) {
-    draw_text(scene, x + 4.0, y + 24.0, label, TEXT_PRIMARY, 24.0);
-    let value_width = value.len() as f64 * 14.0;
-    draw_text(scene, x + _w - value_width - 4.0, y + 24.0, value, TEXT_PRIMARY, 24.0);
-}
-
-/// Draw a label: value pair with font support.
+/// Draw a label: value pair. Label in secondary weight, value right-aligned in primary weight.
 fn draw_label_value_with_font(scene: &mut Scene, x: f64, y: f64, label: &str, value: &str, w: f64, font_data: Option<&FontData>) {
-    draw_text_with_font(scene, x + 4.0, y + 24.0, label, TEXT_PRIMARY, 24.0, font_data);
-    let value_width = value.len() as f64 * 14.0;
-    draw_text_with_font(scene, x + w - value_width - 4.0, y + 24.0, value, TEXT_PRIMARY, 24.0, font_data);
-}
-
-/// Draw a label: value pair with custom value color (bitmap font only).
-#[allow(dead_code)]
-fn draw_label_value_colored(scene: &mut Scene, x: f64, y: f64, label: &str, value: &str, w: f64, color: Color) {
-    draw_text(scene, x + 4.0, y + 24.0, label, TEXT_PRIMARY, 24.0);
-    let value_width = value.len() as f64 * 14.0;
-    draw_text(scene, x + w - value_width - 4.0, y + 24.0, value, color, 24.0);
-}
-
-/// Draw a label: value pair with custom value color and font support.
-fn draw_label_value_colored_with_font(scene: &mut Scene, x: f64, y: f64, label: &str, value: &str, w: f64, color: Color, font_data: Option<&FontData>) {
-    draw_text_with_font(scene, x + 4.0, y + 24.0, label, TEXT_PRIMARY, 24.0, font_data);
-    let value_width = value.len() as f64 * 14.0;
-    draw_text_with_font(scene, x + w - value_width - 4.0, y + 24.0, value, color, 24.0, font_data);
-}
-
-/// Draw a labeled progress bar (bitmap font only).
-#[allow(dead_code)]
-fn draw_label_bar(scene: &mut Scene, x: f64, y: f64, label: &str, percent: f64, w: f64, bar_color: Color) {
-    let label_w = 120.0;
-    draw_text(scene, x + 4.0, y + 24.0, label, TEXT_PRIMARY, 24.0);
-
-    let bar_x = x + label_w;
-    let bar_w = w - label_w - 80.0;
-    let bar_y = y + 8.0;
-    let bg_rect = RoundedRect::new(bar_x, bar_y, bar_x + bar_w, bar_y + BAR_HEIGHT, 3.0);
-    scene.fill(Fill::NonZero, Affine::IDENTITY, BAR_BG, None, &bg_rect);
-
-    let fill_w = (bar_w * percent / 100.0).max(0.0).min(bar_w);
-    if fill_w > 0.0 {
-        let fill_rect = RoundedRect::new(bar_x, bar_y, bar_x + fill_w, bar_y + BAR_HEIGHT, 3.0);
-        scene.fill(Fill::NonZero, Affine::IDENTITY, bar_color, None, &fill_rect);
-    }
-
-    let pct_str = format!("{:.0}%", percent);
-    draw_text(scene, x + w - 70.0, y + 24.0, &pct_str, TEXT_PRIMARY, 24.0);
-}
-
-/// Draw a labeled progress bar with font support.
-fn draw_label_bar_with_font(scene: &mut Scene, x: f64, y: f64, label: &str, percent: f64, w: f64, bar_color: Color, font_data: Option<&FontData>) {
-    let label_w = 120.0;
-    draw_text_with_font(scene, x + 4.0, y + 24.0, label, TEXT_PRIMARY, 24.0, font_data);
-
-    let bar_x = x + label_w;
-    let bar_w = w - label_w - 80.0;
-    let bar_y = y + 8.0;
-    let bg_rect = RoundedRect::new(bar_x, bar_y, bar_x + bar_w, bar_y + BAR_HEIGHT, 3.0);
-    scene.fill(Fill::NonZero, Affine::IDENTITY, BAR_BG, None, &bg_rect);
-
-    let fill_w = (bar_w * percent / 100.0).max(0.0).min(bar_w);
-    if fill_w > 0.0 {
-        let fill_rect = RoundedRect::new(bar_x, bar_y, bar_x + fill_w, bar_y + BAR_HEIGHT, 3.0);
-        scene.fill(Fill::NonZero, Affine::IDENTITY, bar_color, None, &fill_rect);
-    }
-
-    let pct_str = format!("{:.0}%", percent);
-    draw_text_with_font(scene, x + w - 70.0, y + 24.0, &pct_str, TEXT_PRIMARY, 24.0, font_data);
+    draw_text_with_font(scene, x, y, label, TEXT_SECONDARY, DATA_SECONDARY_SIZE, font_data);
+    let value_width = value.len() as f64 * 12.0;
+    draw_text_with_font(scene, (x + w - value_width).max(x + 100.0), y, value, TEXT_PRIMARY, DATA_PRIMARY_SIZE, font_data);
 }
 
 // --- Splash quote rendering ---
@@ -946,14 +771,11 @@ fn splash_alpha(elapsed: f64) -> f32 {
         return 0.0;
     }
     if elapsed < FADE_IN_DURATION {
-        // Fade in: 0 -> 1 with smooth ease-in-out cubic
         let t = (elapsed / FADE_IN_DURATION) as f32;
         ease_in_out(t)
     } else if elapsed < FADE_IN_DURATION + HOLD_DURATION {
-        // Hold at full opacity
         1.0
     } else {
-        // Fade out: 1 -> 0
         let t = ((elapsed - FADE_IN_DURATION - HOLD_DURATION) / FADE_OUT_DURATION) as f32;
         1.0 - ease_in_out(t)
     }
@@ -991,7 +813,6 @@ fn draw_splash_quote(
     let black_with_alpha = Color::new([0.0_f32, 0.0, 0.0, alpha]);
 
     if let Some(font) = font_data {
-        // Use real font rendering (Optima on macOS)
         let font_size: f32 = 48.0;
         let max_text_width = width * 0.7;
         let start_x = width * 0.15;
@@ -1014,14 +835,12 @@ fn draw_splash_quote(
                 .draw(Fill::NonZero, glyphs.into_iter());
         }
     } else {
-        // Fallback: use bitmap font rendering
-        let font_size = 32.0; // doubled from 16
+        let font_size = 32.0;
         let max_chars_per_line = ((width * 0.7) / (font_size * 0.6)) as usize;
         let start_x = width * 0.15;
         let mut y = height * 0.20;
         let line_height_px = font_size * 1.5;
 
-        // Simple word wrapping for bitmap font
         let words: Vec<&str> = ULYSSES_QUOTE.split_whitespace().collect();
         let mut line = String::new();
 
@@ -1073,7 +892,6 @@ fn layout_text_with_font(
     let words: Vec<&str> = text.split_whitespace().collect();
 
     for (i, word) in words.iter().enumerate() {
-        // Measure word width
         let word_width: f64 = word
             .chars()
             .map(|ch| {
@@ -1152,10 +970,159 @@ fn load_system_font(font_names: &[&str]) -> Option<FontData> {
     None
 }
 
+/// Specification for a selectable text region (text, font size, origin, max width).
+pub struct SelectableRegionSpec {
+    pub text: String,
+    pub font_size: f32,
+    pub origin: (f64, f64),
+    pub max_width: Option<f32>,
+}
+
+/// Compute selectable text regions for all instance panels.
+///
+/// This replicates the layout math from `draw_instance_panel` so that
+/// `SelectableText` regions align with the rendered text.
+pub fn compute_selectable_regions(
+    instances: &[LobsterInstance],
+    width: f64,
+    _height: f64,
+) -> Vec<SelectableRegionSpec> {
+    let mut regions = Vec::new();
+
+    if instances.is_empty() {
+        return regions;
+    }
+
+    let title_y = 56.0;
+    let content_top = title_y + 32.0;
+    let content_width = width - LEFT_MARGIN * 2.0;
+    let num_instances = instances.len();
+
+    // Compute panel positions (same logic as render_dashboard).
+    let panel_positions: Vec<(f64, f64, f64, f64)> = if num_instances == 1 {
+        vec![(LEFT_MARGIN, content_top, content_width, 9999.0)]
+    } else {
+        let cols = if num_instances <= 2 { num_instances } else if num_instances <= 4 { 2 } else { 3 };
+        let col_gap = 48.0;
+        let panel_width = (content_width - (cols as f64 - 1.0) * col_gap) / cols as f64;
+
+        instances.iter().enumerate().map(|(idx, _)| {
+            let col = idx % cols;
+            let row = idx / cols;
+            let x = LEFT_MARGIN + col as f64 * (panel_width + col_gap);
+            let y = content_top + row as f64 * 600.0; // approximate
+            (x, y, panel_width, 600.0)
+        }).collect()
+    };
+
+    for (idx, instance) in instances.iter().enumerate() {
+        let (x, y, w, _h) = panel_positions[idx];
+        let max_w = Some(w as f32);
+        let mut cursor_y = y;
+
+        // Hostname
+        cursor_y += 36.0;
+        let hostname = if instance.status == ConnectionStatus::Connected {
+            instance.state.system.hostname.clone()
+        } else {
+            instance.url.clone()
+        };
+        let hostname_font = 36.0_f32;
+        regions.push(SelectableRegionSpec {
+            text: hostname,
+            font_size: hostname_font,
+            origin: (x, cursor_y - hostname_font as f64 * 0.8),
+            max_width: max_w,
+        });
+
+        // Status text
+        let status_str = match &instance.status {
+            ConnectionStatus::Connected => "connected".to_string(),
+            ConnectionStatus::Connecting => "connecting...".to_string(),
+            ConnectionStatus::Disconnected => "disconnected".to_string(),
+            ConnectionStatus::Error(e) => format!("error: {}", &e[..e.len().min(30)]),
+        };
+        cursor_y += DATA_SECONDARY_SIZE as f64 * LINE_HEIGHT_FACTOR;
+        let status_font = DATA_SECONDARY_SIZE as f32;
+        regions.push(SelectableRegionSpec {
+            text: status_str,
+            font_size: status_font,
+            origin: (x, cursor_y - status_font as f64 * 0.8),
+            max_width: max_w,
+        });
+
+        if instance.status != ConnectionStatus::Connected {
+            continue;
+        }
+
+        let state = &instance.state;
+
+        // Skip System section header + 4 data lines
+        cursor_y += SECTION_SPACING;
+        cursor_y += SECTION_SIZE * LINE_HEIGHT_FACTOR + 4.0; // section header
+        cursor_y += DATA_PRIMARY_SIZE * LINE_HEIGHT_FACTOR * 4.0; // uptime, cpu, mem, disk
+        cursor_y += SECTION_SPACING;
+
+        // Sessions section
+        cursor_y += SECTION_SIZE * LINE_HEIGHT_FACTOR + 4.0; // header
+        cursor_y += DATA_PRIMARY_SIZE * LINE_HEIGHT_FACTOR; // "Active: N"
+
+        let claude_sessions: Vec<_> = state.sessions.iter()
+            .filter(|s| s.name == "claude")
+            .collect();
+        let session_count = claude_sessions.len();
+
+        for session in claude_sessions.iter().take(3) {
+            let label = format!("PID {} -- {:.0} MB", session.pid, session.memory_mb);
+            let session_font = DATA_SECONDARY_SIZE as f32;
+            regions.push(SelectableRegionSpec {
+                text: label,
+                font_size: session_font,
+                origin: (x + 16.0, cursor_y - session_font as f64 * 0.8),
+                max_width: max_w,
+            });
+            cursor_y += DATA_SECONDARY_SIZE * LINE_HEIGHT_FACTOR;
+        }
+        if session_count > 3 {
+            cursor_y += ANNOTATION_SIZE * LINE_HEIGHT_FACTOR;
+        }
+
+        // Skip Messages, Activity, Health sections (decorative stats)
+        // ... agents are the interesting selectable content
+
+        // Approximate skip to agents section
+        cursor_y += SECTION_SPACING * 4.0 + DATA_PRIMARY_SIZE * LINE_HEIGHT_FACTOR * 8.0;
+
+        // AGENTS section
+        let agents = &state.subagent_list.agents;
+        if !agents.is_empty() {
+            cursor_y += SECTION_SIZE * LINE_HEIGHT_FACTOR + 4.0; // header
+            for agent in agents.iter().take(4) {
+                let desc = if agent.description.len() > 52 {
+                    format!("{}...", &agent.description[..52])
+                } else {
+                    agent.description.clone()
+                };
+                let agent_font = DATA_SECONDARY_SIZE as f32;
+                regions.push(SelectableRegionSpec {
+                    text: desc,
+                    font_size: agent_font,
+                    origin: (x, cursor_y - agent_font as f64 * 0.8),
+                    max_width: max_w,
+                });
+                cursor_y += DATA_SECONDARY_SIZE * LINE_HEIGHT_FACTOR;
+            }
+        }
+    }
+
+    regions
+}
+
 /// Render the first-run setup screen.
 ///
 /// Shown when `~/.config/bisque-computer/server` is absent. The user types a
 /// WebSocket URL then presses Enter to save and connect.
+/// Purely typographic: no input field box, just text and a cursor line.
 pub fn render_setup_screen(
     scene: &mut Scene,
     width: f64,
@@ -1170,7 +1137,7 @@ pub fn render_setup_screen(
     let cx = width / 2.0;
     let cy = height / 2.0;
 
-    // Title: "Connect to Lobster"
+    // Title
     let title = "Connect to Lobster";
     let title_size = 52.0_f64;
     let title_w = title.len() as f64 * title_size * 0.55;
@@ -1186,50 +1153,35 @@ pub fn render_setup_screen(
     let hint = "(e.g. ws://IP:9100?token=UUID)";
     let hint_size = 22.0_f64;
     let hint_w = hint.len() as f64 * hint_size * 0.55;
-    draw_text_with_font(scene, cx - hint_w / 2.0, cy - 28.0, hint, TEXT_SECONDARY, hint_size, font_data);
+    draw_text_with_font(scene, cx - hint_w / 2.0, cy - 28.0, hint, TEXT_ANNOTATION, hint_size, font_data);
 
-    // Input field
-    let field_w = (width * 0.7).min(900.0);
-    let field_h = 56.0;
-    let field_x = cx - field_w / 2.0;
-    let field_y = cy + 8.0;
-    let field_rect = RoundedRect::new(field_x, field_y, field_x + field_w, field_y + field_h, 6.0);
-
-    // White-ish fill for the input area
-    let field_fill = Color::new([1.0_f32, 1.0, 1.0, 0.85]);
-    scene.fill(Fill::NonZero, Affine::IDENTITY, field_fill, None, &field_rect);
-    // Border
-    scene.stroke(
-        &vello::kurbo::Stroke::new(2.0),
-        Affine::IDENTITY,
-        PANEL_BORDER,
-        None,
-        &field_rect,
-    );
-
-    // Text inside the field
+    // Typed text (no box, just text with cursor)
+    let field_y = cy + 24.0;
     let (display_text, text_color) = if input_buffer.is_empty() {
         ("ws://".to_string(), TEXT_SECONDARY)
     } else {
         (input_buffer.to_string(), TEXT_PRIMARY)
     };
-    draw_text_with_font(scene, field_x + 14.0, field_y + 38.0, &display_text, text_color, 28.0, font_data);
+    let text_size = 28.0_f64;
+    let text_w = display_text.len() as f64 * text_size * 0.55;
+    let text_x = cx - text_w / 2.0;
+    draw_text_with_font(scene, text_x, field_y, &display_text, text_color, text_size, font_data);
 
-    // Cursor
+    // Thin cursor line after the text
     let char_advance = 16.0_f64;
     let cursor_x = if input_buffer.is_empty() {
-        field_x + 14.0 + 5.0 * char_advance // after "ws://"
+        text_x + 5.0 * char_advance // after "ws://"
     } else {
-        field_x + 14.0 + input_buffer.len() as f64 * char_advance
+        text_x + input_buffer.len() as f64 * char_advance
     };
-    let cursor_rect = Rect::new(cursor_x, field_y + 12.0, cursor_x + 2.0, field_y + field_h - 12.0);
+    let cursor_rect = Rect::new(cursor_x, field_y - 20.0, cursor_x + 1.5, field_y + 4.0);
     scene.fill(Fill::NonZero, Affine::IDENTITY, TEXT_PRIMARY, None, &cursor_rect);
 
     // Footer
     let footer = "Press Enter to connect  |  Press Escape to quit";
     let footer_size = 22.0_f64;
     let footer_w = footer.len() as f64 * footer_size * 0.55;
-    draw_text_with_font(scene, cx - footer_w / 2.0, cy + 120.0, footer, TEXT_SECONDARY, footer_size, font_data);
+    draw_text_with_font(scene, cx - footer_w / 2.0, cy + 120.0, footer, TEXT_ANNOTATION, footer_size, font_data);
 }
 
 /// Load the best available font for readable text.
@@ -1258,406 +1210,6 @@ pub fn load_mono_font() -> Option<FontData> {
     ])
 }
 
-// --- 3D Isometric Visualization ---
-
-/// Isometric projection constants.
-/// We use a standard isometric angle: x-axis goes right-and-down at 30deg,
-/// z-axis goes right-and-up at 30deg, y-axis goes straight up.
-const ISO_ANGLE: f64 = std::f64::consts::PI / 6.0; // 30 degrees
-
-/// Convert a 3D (x, y, z) point to 2D screen coordinates using isometric projection.
-/// x: left-right on ground, z: front-back on ground, y: height (up).
-/// Returns (screen_x, screen_y) relative to an origin point.
-fn iso_to_screen(x: f64, y: f64, z: f64) -> (f64, f64) {
-    let cos_a = ISO_ANGLE.cos(); // ~0.866
-    let sin_a = ISO_ANGLE.sin(); // ~0.5
-    let sx = (x - z) * cos_a;
-    let sy = (x + z) * sin_a - y;
-    (sx, sy)
-}
-
-/// Draw the full 3D visualization panel within the given bounds.
-/// Shows sessions as isometric pillars and tasks as stacked cubes.
-/// When disconnected, shows a demo visualization with animated placeholder geometry.
-fn draw_3d_visualization(
-    scene: &mut Scene,
-    x: f64,
-    y: f64,
-    w: f64,
-    h: f64,
-    instance: &crate::protocol::LobsterInstance,
-    elapsed: f64,
-    font_data: Option<&FontData>,
-) {
-    let state = &instance.state;
-    let is_connected = instance.status == ConnectionStatus::Connected;
-
-    // Panel background
-    let panel_rect = RoundedRect::new(x, y, x + w, y + h, CORNER_RADIUS);
-    scene.fill(Fill::NonZero, Affine::IDENTITY, PANEL_BG, None, &panel_rect);
-    scene.stroke(
-        &vello::kurbo::Stroke::new(1.5),
-        Affine::IDENTITY,
-        PANEL_BORDER,
-        None,
-        &panel_rect,
-    );
-
-    // Section header
-    let header_title = if is_connected { "3D OVERVIEW" } else { "3D OVERVIEW (awaiting connection)" };
-    let header_y = draw_section_header_with_font(scene, x + PANEL_PADDING, y + PANEL_PADDING, w - 2.0 * PANEL_PADDING, header_title, font_data);
-
-    let viz_x = x + PANEL_PADDING;
-    let viz_y = header_y + 8.0;
-    let viz_w = w - 2.0 * PANEL_PADDING;
-    let viz_h = h - (viz_y - y) - PANEL_PADDING;
-
-    // Draw the ground plane (isometric diamond)
-    draw_iso_ground(scene, viz_x, viz_y, viz_w, viz_h);
-
-    // Origin point for the isometric scene (center-bottom of the viz area)
-    let origin_x = viz_x + viz_w * 0.5;
-    let origin_y = viz_y + viz_h * 0.80;
-
-    let scale = (viz_w.min(viz_h) / 400.0).max(0.4).min(1.5);
-
-    if is_connected {
-        // --- Connected: show real data ---
-
-        // Sessions pillars (left side)
-        let claude_sessions: Vec<_> = state.sessions.iter()
-            .filter(|s| s.name == "claude")
-            .collect();
-        let session_count = claude_sessions.len();
-
-        for (i, session) in claude_sessions.iter().enumerate() {
-            let grid_x = -80.0 * scale + (i as f64) * 50.0 * scale;
-            let grid_z = -40.0 * scale;
-
-            let base_height = (session.memory_mb / 10.0).clamp(20.0, 120.0) * scale;
-            let breath = (elapsed * 1.5 + i as f64 * 0.7).sin() * 3.0 * scale;
-            let pillar_h = base_height + breath;
-            let pillar_w = 30.0 * scale;
-
-            draw_iso_shadow(scene, origin_x, origin_y, grid_x, grid_z, pillar_w, scale);
-            draw_iso_box(
-                scene, origin_x, origin_y,
-                grid_x, 0.0, grid_z,
-                pillar_w, pillar_h, pillar_w * 0.8,
-                ISO_SESSION_TOP, ISO_SESSION_LEFT, ISO_SESSION_RIGHT,
-            );
-
-            let (lx, ly) = iso_to_screen(grid_x, -12.0 * scale, grid_z);
-            draw_text_with_font(scene, origin_x + lx - 10.0 * scale, origin_y + ly, &format!("S{}", i + 1), TEXT_PRIMARY, 16.0 * scale, font_data);
-        }
-
-        let label_x = viz_x + 8.0;
-        let label_y = viz_y + viz_h - 10.0;
-        draw_text_with_font(scene, label_x, label_y, &format!("{} session{}", session_count, if session_count != 1 { "s" } else { "" }), TEXT_PRIMARY, 18.0, font_data);
-
-        // Task cubes (right side)
-        let tasks = &state.tasks.summary;
-        let inbox_count = state.message_queues.inbox.count;
-
-        let cube_size = 22.0 * scale;
-        let task_base_x = 30.0 * scale;
-        let task_base_z = -30.0 * scale;
-
-        // Inbox items as red cubes
-        let inbox_to_show = inbox_count.min(5) as usize;
-        for i in 0..inbox_to_show {
-            let ix = task_base_x + (i as f64) * (cube_size * 1.2);
-            let iz = task_base_z - 40.0 * scale;
-            let bounce = ((elapsed * 2.5 + i as f64 * 0.4).sin().abs()) * 8.0 * scale;
-
-            draw_iso_shadow(scene, origin_x, origin_y, ix, iz, cube_size * 0.6, scale);
-            draw_iso_box(
-                scene, origin_x, origin_y,
-                ix, bounce, iz,
-                cube_size, cube_size, cube_size,
-                ISO_INBOX_TOP, ISO_INBOX_LEFT, ISO_INBOX_RIGHT,
-            );
-        }
-        if inbox_count > 5 {
-            let (lx, ly) = iso_to_screen(task_base_x + 5.0 * cube_size * 1.2, 0.0, task_base_z - 40.0 * scale);
-            draw_text_with_font(scene, origin_x + lx, origin_y + ly, &format!("+{}", inbox_count - 5), TEXT_PRIMARY, 14.0 * scale, font_data);
-        }
-
-        // Completed tasks (green)
-        let completed = tasks.completed.min(10) as usize;
-        draw_task_stack(
-            scene, origin_x, origin_y,
-            task_base_x, task_base_z,
-            cube_size, completed,
-            ISO_TASK_DONE_TOP, ISO_TASK_DONE_LEFT, ISO_TASK_DONE_RIGHT,
-            elapsed, 0.0, scale,
-        );
-
-        // In-progress tasks (blue)
-        let in_progress = tasks.in_progress.min(5) as usize;
-        let completed_height = completed as f64 * cube_size * 0.65;
-        draw_task_stack(
-            scene, origin_x, origin_y,
-            task_base_x + cube_size * 0.3, task_base_z + cube_size * 0.3,
-            cube_size * 0.9, in_progress,
-            ISO_TASK_ACTIVE_TOP, ISO_TASK_ACTIVE_LEFT, ISO_TASK_ACTIVE_RIGHT,
-            elapsed, completed_height, scale,
-        );
-
-        // Pending tasks (amber)
-        let pending = tasks.pending.min(8) as usize;
-        draw_task_stack(
-            scene, origin_x, origin_y,
-            task_base_x + cube_size * 1.8, task_base_z,
-            cube_size * 0.85, pending,
-            ISO_TASK_PENDING_TOP, ISO_TASK_PENDING_LEFT, ISO_TASK_PENDING_RIGHT,
-            elapsed, 0.0, scale,
-        );
-
-        // Legend
-        let legend_x = viz_x + viz_w - 180.0;
-        let legend_y = viz_y + viz_h - 50.0;
-        draw_legend_dot(scene, legend_x, legend_y, ISO_TASK_DONE_TOP);
-        draw_text_with_font(scene, legend_x + 14.0, legend_y + 4.0, &format!("{} done", tasks.completed), TEXT_PRIMARY, 14.0, font_data);
-        draw_legend_dot(scene, legend_x, legend_y + 16.0, ISO_TASK_ACTIVE_TOP);
-        draw_text_with_font(scene, legend_x + 14.0, legend_y + 20.0, &format!("{} active", tasks.in_progress), TEXT_PRIMARY, 14.0, font_data);
-        draw_legend_dot(scene, legend_x, legend_y + 32.0, ISO_TASK_PENDING_TOP);
-        draw_text_with_font(scene, legend_x + 14.0, legend_y + 36.0, &format!("{} pending", tasks.pending), TEXT_PRIMARY, 14.0, font_data);
-        if inbox_count > 0 {
-            draw_legend_dot(scene, legend_x, legend_y + 48.0, ISO_INBOX_TOP);
-            draw_text_with_font(scene, legend_x + 14.0, legend_y + 52.0, &format!("{} inbox", inbox_count), TEXT_PRIMARY, 14.0, font_data);
-        }
-    } else {
-        // --- Disconnected: show demo visualization with animated pillars ---
-        let cube_size = 22.0 * scale;
-
-        // Demo session pillars (3 animated pillars)
-        for i in 0..3 {
-            let grid_x = -80.0 * scale + (i as f64) * 50.0 * scale;
-            let grid_z = -40.0 * scale;
-            let base_height = (40.0 + i as f64 * 20.0) * scale;
-            let breath = (elapsed * 1.2 + i as f64 * 0.9).sin() * 5.0 * scale;
-            let pillar_h = base_height + breath;
-            let pillar_w = 30.0 * scale;
-
-            draw_iso_shadow(scene, origin_x, origin_y, grid_x, grid_z, pillar_w, scale);
-            draw_iso_box(
-                scene, origin_x, origin_y,
-                grid_x, 0.0, grid_z,
-                pillar_w, pillar_h, pillar_w * 0.8,
-                ISO_SESSION_TOP, ISO_SESSION_LEFT, ISO_SESSION_RIGHT,
-            );
-        }
-
-        // Demo task cubes (a few animated cubes on the right)
-        let task_base_x = 30.0 * scale;
-        let task_base_z = -30.0 * scale;
-
-        draw_task_stack(
-            scene, origin_x, origin_y,
-            task_base_x, task_base_z,
-            cube_size, 3,
-            ISO_TASK_DONE_TOP, ISO_TASK_DONE_LEFT, ISO_TASK_DONE_RIGHT,
-            elapsed, 0.0, scale,
-        );
-        draw_task_stack(
-            scene, origin_x, origin_y,
-            task_base_x + cube_size * 1.8, task_base_z,
-            cube_size * 0.85, 2,
-            ISO_TASK_PENDING_TOP, ISO_TASK_PENDING_LEFT, ISO_TASK_PENDING_RIGHT,
-            elapsed, 0.0, scale,
-        );
-
-        // "Waiting for data..." label
-        let label_x = viz_x + 8.0;
-        let label_y = viz_y + viz_h - 10.0;
-        draw_text_with_font(scene, label_x, label_y, "Waiting for connection...", TEXT_PRIMARY, 18.0, font_data);
-    }
-}
-
-/// Draw a small colored square as a legend indicator.
-fn draw_legend_dot(scene: &mut Scene, x: f64, y: f64, color: Color) {
-    let rect = Rect::new(x, y - 4.0, x + 10.0, y + 6.0);
-    scene.fill(Fill::NonZero, Affine::IDENTITY, color, None, &rect);
-}
-
-/// Draw the isometric ground plane as a diamond shape with grid.
-fn draw_iso_ground(scene: &mut Scene, x: f64, y: f64, w: f64, h: f64) {
-    let cx = x + w * 0.5;
-    let cy = y + h * 0.80;
-    let hw = w * 0.45;
-    let hh = hw * 0.5; // isometric ratio
-
-    // Ground diamond
-    let mut path = BezPath::new();
-    path.move_to(Point::new(cx, cy - hh));       // top
-    path.line_to(Point::new(cx + hw, cy));         // right
-    path.line_to(Point::new(cx, cy + hh));         // bottom
-    path.line_to(Point::new(cx - hw, cy));         // left
-    path.close_path();
-    scene.fill(Fill::NonZero, Affine::IDENTITY, ISO_GROUND, None, &path);
-
-    // Isometric grid: lines along both axes of the diamond
-    let steps = 5;
-    for i in 1..steps {
-        let t = i as f64 / steps as f64;
-
-        // Lines parallel to top-right edge (from left edge to bottom edge)
-        let mut line1 = BezPath::new();
-        let p1 = Point::new(cx - hw * (1.0 - t), cy - hh * t);
-        let p2 = Point::new(cx + hw * t, cy + hh * (1.0 - t));
-        line1.move_to(p1);
-        line1.line_to(p2);
-        scene.stroke(
-            &vello::kurbo::Stroke::new(0.5),
-            Affine::IDENTITY, ISO_GRID, None, &line1,
-        );
-
-        // Lines parallel to top-left edge (from right edge to bottom edge)
-        let mut line2 = BezPath::new();
-        let p3 = Point::new(cx + hw * (1.0 - t), cy - hh * t);
-        let p4 = Point::new(cx - hw * t, cy + hh * (1.0 - t));
-        line2.move_to(p3);
-        line2.line_to(p4);
-        scene.stroke(
-            &vello::kurbo::Stroke::new(0.5),
-            Affine::IDENTITY, ISO_GRID, None, &line2,
-        );
-    }
-}
-
-/// Draw a soft shadow on the ground plane beneath an isometric object.
-fn draw_iso_shadow(
-    scene: &mut Scene,
-    origin_x: f64,
-    origin_y: f64,
-    grid_x: f64,
-    grid_z: f64,
-    size: f64,
-    _scale: f64,
-) {
-    let (sx, sy) = iso_to_screen(grid_x, 0.0, grid_z);
-    let shadow_w = size * 1.2;
-    let shadow_h = size * 0.4;
-    let cx = origin_x + sx;
-    let cy = origin_y + sy;
-
-    let ellipse = vello::kurbo::Ellipse::new(Point::new(cx, cy + 2.0), (shadow_w, shadow_h), 0.0);
-    scene.fill(Fill::NonZero, Affine::IDENTITY, ISO_SHADOW, None, &ellipse);
-}
-
-/// Draw a 3D isometric box (rectangular prism) at the given grid position.
-/// (grid_x, base_y, grid_z) is the base position in 3D space.
-/// (w, h, d) are width, height, depth of the box.
-fn draw_iso_box(
-    scene: &mut Scene,
-    origin_x: f64,
-    origin_y: f64,
-    grid_x: f64,
-    base_y: f64,
-    grid_z: f64,
-    w: f64,
-    h: f64,
-    d: f64,
-    top_color: Color,
-    left_color: Color,
-    right_color: Color,
-) {
-    // 8 corners of the box in 3D, projected to 2D
-    // Bottom face corners
-    let b_fl = iso_to_screen(grid_x, base_y, grid_z);         // front-left
-    let b_fr = iso_to_screen(grid_x + w, base_y, grid_z);     // front-right
-    let _b_br = iso_to_screen(grid_x + w, base_y, grid_z + d); // back-right
-    let b_bl = iso_to_screen(grid_x, base_y, grid_z + d);      // back-left
-
-    // Top face corners
-    let t_fl = iso_to_screen(grid_x, base_y + h, grid_z);
-    let t_fr = iso_to_screen(grid_x + w, base_y + h, grid_z);
-    let t_br = iso_to_screen(grid_x + w, base_y + h, grid_z + d);
-    let t_bl = iso_to_screen(grid_x, base_y + h, grid_z + d);
-
-    // Convert to screen coordinates
-    let to_pt = |p: (f64, f64)| Point::new(origin_x + p.0, origin_y + p.1);
-
-    // Draw faces back-to-front for correct occlusion:
-    // 1. Left face (back-left side)
-    let mut left_face = BezPath::new();
-    left_face.move_to(to_pt(b_fl));
-    left_face.line_to(to_pt(b_bl));
-    left_face.line_to(to_pt(t_bl));
-    left_face.line_to(to_pt(t_fl));
-    left_face.close_path();
-    scene.fill(Fill::NonZero, Affine::IDENTITY, left_color, None, &left_face);
-
-    // 2. Right face (front-right side)
-    let mut right_face = BezPath::new();
-    right_face.move_to(to_pt(b_fl));
-    right_face.line_to(to_pt(b_fr));
-    right_face.line_to(to_pt(t_fr));
-    right_face.line_to(to_pt(t_fl));
-    right_face.close_path();
-    scene.fill(Fill::NonZero, Affine::IDENTITY, right_color, None, &right_face);
-
-    // 3. Top face
-    let mut top_face = BezPath::new();
-    top_face.move_to(to_pt(t_fl));
-    top_face.line_to(to_pt(t_fr));
-    top_face.line_to(to_pt(t_br));
-    top_face.line_to(to_pt(t_bl));
-    top_face.close_path();
-    scene.fill(Fill::NonZero, Affine::IDENTITY, top_color, None, &top_face);
-
-    // Edge outlines for definition
-    let edge_color = Color::new([0.0_f32, 0.0, 0.0, 0.15]);
-    let stroke = vello::kurbo::Stroke::new(0.8);
-
-    // Left face edges
-    scene.stroke(&stroke, Affine::IDENTITY, edge_color, None, &left_face);
-    // Right face edges
-    scene.stroke(&stroke, Affine::IDENTITY, edge_color, None, &right_face);
-    // Top face edges
-    scene.stroke(&stroke, Affine::IDENTITY, edge_color, None, &top_face);
-}
-
-/// Draw a stack of cubes for tasks.
-fn draw_task_stack(
-    scene: &mut Scene,
-    origin_x: f64,
-    origin_y: f64,
-    base_x: f64,
-    base_z: f64,
-    cube_size: f64,
-    count: usize,
-    top_color: Color,
-    left_color: Color,
-    right_color: Color,
-    elapsed: f64,
-    base_height: f64,
-    _scale: f64,
-) {
-    let stack_gap = cube_size * 0.65; // slight overlap for tight stacking
-
-    for i in 0..count {
-        let y_pos = base_height + i as f64 * stack_gap;
-        // Subtle wobble animation
-        let wobble_x = (elapsed * 0.8 + i as f64 * 1.1).sin() * 1.5;
-        let wobble_z = (elapsed * 0.6 + i as f64 * 0.9).cos() * 1.0;
-
-        // Shadow only for bottom cube
-        if i == 0 && base_height < 0.1 {
-            draw_iso_shadow(scene, origin_x, origin_y, base_x + wobble_x, base_z + wobble_z, cube_size * 0.5, 1.0);
-        }
-
-        draw_iso_box(
-            scene, origin_x, origin_y,
-            base_x + wobble_x, y_pos, base_z + wobble_z,
-            cube_size, cube_size, cube_size * 0.8,
-            top_color, left_color, right_color,
-        );
-    }
-}
-
-
 // --- Utility functions ---
 
 fn format_uptime(seconds: u64) -> String {
@@ -1671,24 +1223,6 @@ fn format_uptime(seconds: u64) -> String {
     } else {
         format!("{}m", mins)
     }
-}
-
-fn cpu_color(percent: f64) -> Color {
-    if percent > 80.0 { ACCENT_RED }
-    else if percent > 50.0 { ACCENT_AMBER }
-    else { ACCENT_GREEN }
-}
-
-fn mem_color(percent: f64) -> Color {
-    if percent > 85.0 { ACCENT_RED }
-    else if percent > 60.0 { ACCENT_AMBER }
-    else { ACCENT_GREEN }
-}
-
-fn disk_color(percent: f64) -> Color {
-    if percent > 90.0 { ACCENT_RED }
-    else if percent > 75.0 { ACCENT_AMBER }
-    else { ACCENT_GREEN }
 }
 
 // =============================================================================
@@ -1705,7 +1239,6 @@ mod tests {
 
     #[test]
     fn test_bg_color_is_bisque() {
-        // CSS bisque = rgb(255, 228, 196) = [1.0, 0.894, 0.769]
         let components = BG_COLOR.components;
         assert!((components[0] - 1.0).abs() < 0.01, "BG red channel should be ~1.0");
         assert!((components[1] - 0.894).abs() < 0.01, "BG green channel should be ~0.894");
@@ -1723,105 +1256,12 @@ mod tests {
     }
 
     #[test]
-    fn test_text_light_is_black() {
-        // TEXT_LIGHT (used on headers) should also be black
-        let components = TEXT_LIGHT.components;
-        assert_eq!(components[0], 0.0, "TEXT_LIGHT red should be 0.0");
-        assert_eq!(components[1], 0.0, "TEXT_LIGHT green should be 0.0");
-        assert_eq!(components[2], 0.0, "TEXT_LIGHT blue should be 0.0");
-        assert_eq!(components[3], 1.0, "TEXT_LIGHT alpha should be 1.0");
-    }
-
-    #[test]
     fn test_text_secondary_is_black_with_opacity() {
         let components = TEXT_SECONDARY.components;
         assert_eq!(components[0], 0.0, "TEXT_SECONDARY red should be 0.0");
         assert_eq!(components[1], 0.0, "TEXT_SECONDARY green should be 0.0");
         assert_eq!(components[2], 0.0, "TEXT_SECONDARY blue should be 0.0");
-        assert!((components[3] - 0.65).abs() < 0.01, "TEXT_SECONDARY alpha should be ~0.65");
-    }
-
-    #[test]
-    fn test_accent_colors_are_distinct() {
-        // Ensure accent colors are different from each other
-        assert_ne!(ACCENT_GREEN.components, ACCENT_RED.components);
-        assert_ne!(ACCENT_GREEN.components, ACCENT_AMBER.components);
-        assert_ne!(ACCENT_RED.components, ACCENT_AMBER.components);
-        assert_ne!(ACCENT_BLUE.components, ACCENT_GREEN.components);
-    }
-
-    #[test]
-    fn test_panel_bg_lighter_than_main_bg() {
-        // Panel background should be lighter (higher values) than the main background
-        // to create visual hierarchy
-        assert!(PANEL_BG.components[1] > BG_COLOR.components[1],
-            "Panel BG green channel should be lighter than main BG");
-    }
-
-    // --- Isometric projection tests ---
-
-    #[test]
-    fn test_iso_to_screen_origin() {
-        let (sx, sy) = iso_to_screen(0.0, 0.0, 0.0);
-        assert!((sx).abs() < 1e-10, "Origin x should be ~0, got {}", sx);
-        assert!((sy).abs() < 1e-10, "Origin y should be ~0, got {}", sy);
-    }
-
-    #[test]
-    fn test_iso_to_screen_x_axis() {
-        // Moving along the x-axis should go right and down
-        let (sx, sy) = iso_to_screen(100.0, 0.0, 0.0);
-        assert!(sx > 0.0, "Positive x should project right, got {}", sx);
-        assert!(sy > 0.0, "Positive x should project down, got {}", sy);
-    }
-
-    #[test]
-    fn test_iso_to_screen_z_axis() {
-        // Moving along the z-axis should go left and down
-        let (sx, sy) = iso_to_screen(0.0, 0.0, 100.0);
-        assert!(sx < 0.0, "Positive z should project left, got {}", sx);
-        assert!(sy > 0.0, "Positive z should project down, got {}", sy);
-    }
-
-    #[test]
-    fn test_iso_to_screen_y_axis() {
-        // Moving up along the y-axis should go up on screen (negative sy)
-        let (sx, sy) = iso_to_screen(0.0, 100.0, 0.0);
-        assert!((sx).abs() < 1e-10, "Y movement should not affect screen x");
-        assert!(sy < 0.0, "Positive y should project up (negative sy), got {}", sy);
-    }
-
-    #[test]
-    fn test_iso_to_screen_symmetry() {
-        // iso_to_screen(a, 0, 0) and iso_to_screen(0, 0, a) should be mirror images
-        let (sx1, sy1) = iso_to_screen(100.0, 0.0, 0.0);
-        let (sx2, sy2) = iso_to_screen(0.0, 0.0, 100.0);
-        assert!((sx1 + sx2).abs() < 1e-10, "x and z projections should mirror in x");
-        assert!((sy1 - sy2).abs() < 1e-10, "x and z projections should have same y");
-    }
-
-    #[test]
-    fn test_iso_angle_is_30_degrees() {
-        let expected = std::f64::consts::PI / 6.0;
-        assert!((ISO_ANGLE - expected).abs() < 1e-10, "ISO_ANGLE should be pi/6 (30 degrees)");
-    }
-
-    #[test]
-    fn test_iso_projection_uses_correct_trig() {
-        // Verify the formula: sx = (x - z) * cos(30), sy = (x + z) * sin(30) - y
-        let x = 50.0;
-        let y = 30.0;
-        let z = 20.0;
-        let (sx, sy) = iso_to_screen(x, y, z);
-
-        let cos30 = (std::f64::consts::PI / 6.0).cos();
-        let sin30 = (std::f64::consts::PI / 6.0).sin();
-
-        let expected_sx = (x - z) * cos30;
-        let expected_sy = (x + z) * sin30 - y;
-
-        assert!((sx - expected_sx).abs() < 1e-10, "sx formula mismatch");
-        assert!((sy - expected_sy).abs() < 1e-10, "sy formula mismatch");
+        assert!((components[3] - 0.50).abs() < 0.01, "TEXT_SECONDARY alpha should be ~0.50");
     }
 
     // --- Splash animation tests ---
@@ -1833,7 +1273,6 @@ mod tests {
 
     #[test]
     fn test_splash_alpha_reaches_full() {
-        // At the end of fade-in, should be close to 1.0
         let alpha = splash_alpha(FADE_IN_DURATION);
         assert!((alpha - 1.0).abs() < 0.01, "Alpha at end of fade-in should be ~1.0, got {}", alpha);
     }
@@ -1883,7 +1322,6 @@ mod tests {
 
     #[test]
     fn test_ease_in_out_monotonic() {
-        // The function should be monotonically increasing
         let mut prev = 0.0f32;
         for i in 1..=100 {
             let t = i as f32 / 100.0;
@@ -1897,10 +1335,7 @@ mod tests {
 
     #[test]
     fn test_load_readable_font_has_fallbacks() {
-        // This test verifies the function runs without panicking.
-        // On Linux CI, it may return None (no macOS fonts), which is fine.
         let result = load_readable_font();
-        // Either it loads a font or returns None -- both are valid
         let _ = result;
     }
 
@@ -1926,27 +1361,9 @@ mod tests {
 
     #[test]
     fn test_layout_constants_positive() {
-        assert!(MARGIN > 0.0);
-        assert!(PANEL_PADDING > 0.0);
-        assert!(PANEL_GAP > 0.0);
-        assert!(HEADER_HEIGHT > 0.0);
-        assert!(SECTION_HEIGHT > 0.0);
-        assert!(LINE_HEIGHT > 0.0);
-        assert!(BAR_HEIGHT > 0.0);
-        assert!(CORNER_RADIUS > 0.0);
-        assert!(STATUS_DOT_RADIUS > 0.0);
-    }
-
-    #[test]
-    fn test_header_height_accommodates_doubled_text() {
-        // Header height should be at least 60.0 for doubled text
-        assert!(HEADER_HEIGHT >= 60.0, "Header should be tall enough for 2x text");
-    }
-
-    #[test]
-    fn test_line_height_accommodates_doubled_text() {
-        // Line height should be at least 30.0 for doubled text
-        assert!(LINE_HEIGHT >= 30.0, "Line height should accommodate 2x text");
+        assert!(LEFT_MARGIN > 0.0);
+        assert!(SECTION_SPACING > 0.0);
+        assert!(RULE_THICKNESS > 0.0);
     }
 
     // --- Utility function tests ---
@@ -1973,43 +1390,10 @@ mod tests {
         assert_eq!(format_uptime(172800), "2d 0h 0m");
     }
 
-    #[test]
-    fn test_cpu_color_green_for_low() {
-        let color = cpu_color(10.0);
-        assert_eq!(color.components, ACCENT_GREEN.components);
-    }
-
-    #[test]
-    fn test_cpu_color_amber_for_medium() {
-        let color = cpu_color(60.0);
-        assert_eq!(color.components, ACCENT_AMBER.components);
-    }
-
-    #[test]
-    fn test_cpu_color_red_for_high() {
-        let color = cpu_color(90.0);
-        assert_eq!(color.components, ACCENT_RED.components);
-    }
-
-    #[test]
-    fn test_mem_color_thresholds() {
-        assert_eq!(mem_color(50.0).components, ACCENT_GREEN.components);
-        assert_eq!(mem_color(70.0).components, ACCENT_AMBER.components);
-        assert_eq!(mem_color(90.0).components, ACCENT_RED.components);
-    }
-
-    #[test]
-    fn test_disk_color_thresholds() {
-        assert_eq!(disk_color(50.0).components, ACCENT_GREEN.components);
-        assert_eq!(disk_color(80.0).components, ACCENT_AMBER.components);
-        assert_eq!(disk_color(95.0).components, ACCENT_RED.components);
-    }
-
     // --- Bitmap font tests ---
 
     #[test]
     fn test_char_bitmap_all_printable_ascii() {
-        // Every printable ASCII char should return a 7-element array
         for ch in 32u8..=126 {
             let bitmap = get_char_bitmap(ch);
             assert_eq!(bitmap.len(), 7, "Bitmap for '{}' should have 7 rows", ch as char);
@@ -2017,15 +1401,7 @@ mod tests {
     }
 
     #[test]
-    fn test_char_bitmap_space_is_empty() {
-        // Space doesn't go through the bitmap renderer (skipped in draw_text)
-        // but the bitmap itself should be whatever the default is
-        // (doesn't matter since spaces are skipped)
-    }
-
-    #[test]
     fn test_char_bitmap_letters_not_empty() {
-        // Common letters should have at least some pixels set
         for ch in b'A'..=b'Z' {
             let bitmap = get_char_bitmap(ch);
             let total_pixels: u32 = bitmap.iter().map(|row| row.count_ones()).sum();
@@ -2049,32 +1425,9 @@ mod tests {
 
     #[test]
     fn test_char_bitmap_unknown_gives_box() {
-        // Unknown characters should render as a box (filled outline)
         let bitmap = get_char_bitmap(0xFF);
         let expected_box: [u8; 7] = [0b11111, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11111];
         assert_eq!(bitmap, expected_box, "Unknown chars should render as a box");
-    }
-
-    // --- 3D Isometric color tests ---
-
-    #[test]
-    fn test_iso_colors_have_three_shading_levels() {
-        // Each iso object should have top (brightest), right (medium), left (darkest)
-        // for session pillars
-        assert!(ISO_SESSION_TOP.components[0] > ISO_SESSION_LEFT.components[0],
-            "Session top should be brighter than left");
-        assert!(ISO_SESSION_RIGHT.components[0] > ISO_SESSION_LEFT.components[0],
-            "Session right should be brighter than left");
-
-        // for task cubes (done)
-        assert!(ISO_TASK_DONE_RIGHT.components[1] > ISO_TASK_DONE_LEFT.components[1],
-            "Task done right should be brighter than left (green channel)");
-    }
-
-    #[test]
-    fn test_iso_shadow_is_semi_transparent() {
-        assert!(ISO_SHADOW.components[3] < 0.5,
-            "Shadow should be semi-transparent, got alpha {}", ISO_SHADOW.components[3]);
     }
 
     // --- Render pipeline integration tests ---
@@ -2083,8 +1436,7 @@ mod tests {
     fn test_render_dashboard_no_instances() {
         let mut scene = Scene::new();
         let instances = Arc::new(Mutex::new(Vec::new()));
-        // Should not panic when rendering with no instances
-        render_dashboard(&mut scene, 1280.0, 800.0, &instances, 0.0, None, &VoiceUiState::Idle, true, &DesignTokens::default());
+        render_dashboard(&mut scene, 1280.0, 800.0, &instances, 0.0, None, &VoiceUiState::Idle, false, &DesignTokens::default());
     }
 
     #[test]
@@ -2092,8 +1444,7 @@ mod tests {
         let mut scene = Scene::new();
         let instance = crate::protocol::LobsterInstance::new("ws://localhost:9100".to_string());
         let instances = Arc::new(Mutex::new(vec![instance]));
-        // Should not panic, and should still render 3D viz (demo mode)
-        render_dashboard(&mut scene, 1280.0, 800.0, &instances, 0.0, None, &VoiceUiState::Idle, true, &DesignTokens::default());
+        render_dashboard(&mut scene, 1280.0, 800.0, &instances, 0.0, None, &VoiceUiState::Idle, false, &DesignTokens::default());
     }
 
     #[test]
@@ -2106,7 +1457,7 @@ mod tests {
         instance.state.system.memory.percent = 60.0;
         instance.state.system.disk.percent = 30.0;
         let instances = Arc::new(Mutex::new(vec![instance]));
-        render_dashboard(&mut scene, 1280.0, 800.0, &instances, 0.0, None, &VoiceUiState::Idle, true, &DesignTokens::default());
+        render_dashboard(&mut scene, 1280.0, 800.0, &instances, 0.0, None, &VoiceUiState::Idle, false, &DesignTokens::default());
     }
 
     #[test]
@@ -2117,72 +1468,23 @@ mod tests {
         inst1.state.system.hostname = "host1".to_string();
         let inst2 = crate::protocol::LobsterInstance::new("ws://host2:9100".to_string());
         let instances = Arc::new(Mutex::new(vec![inst1, inst2]));
-        render_dashboard(&mut scene, 1920.0, 1080.0, &instances, 5.0, None, &VoiceUiState::Idle, true, &DesignTokens::default());
+        render_dashboard(&mut scene, 1920.0, 1080.0, &instances, 5.0, None, &VoiceUiState::Idle, false, &DesignTokens::default());
     }
 
     #[test]
     fn test_render_dashboard_during_splash() {
         let mut scene = Scene::new();
         let instances = Arc::new(Mutex::new(Vec::new()));
-        // During splash animation (elapsed < TOTAL_SPLASH_DURATION)
-        render_dashboard(&mut scene, 1280.0, 800.0, &instances, 1.0, None, &VoiceUiState::Idle, true, &DesignTokens::default());
-        render_dashboard(&mut scene, 1280.0, 800.0, &instances, 4.0, None, &VoiceUiState::Idle, true, &DesignTokens::default());
-        render_dashboard(&mut scene, 1280.0, 800.0, &instances, 7.0, None, &VoiceUiState::Idle, true, &DesignTokens::default());
+        render_dashboard(&mut scene, 1280.0, 800.0, &instances, 1.0, None, &VoiceUiState::Idle, false, &DesignTokens::default());
+        render_dashboard(&mut scene, 1280.0, 800.0, &instances, 4.0, None, &VoiceUiState::Idle, false, &DesignTokens::default());
+        render_dashboard(&mut scene, 1280.0, 800.0, &instances, 7.0, None, &VoiceUiState::Idle, false, &DesignTokens::default());
     }
 
     #[test]
     fn test_render_dashboard_after_splash() {
         let mut scene = Scene::new();
         let instances = Arc::new(Mutex::new(Vec::new()));
-        // After splash
-        render_dashboard(&mut scene, 1280.0, 800.0, &instances, 100.0, None, &VoiceUiState::Idle, true, &DesignTokens::default());
-    }
-
-    #[test]
-    fn test_3d_visualization_with_tasks() {
-        let mut scene = Scene::new();
-        let mut instance = crate::protocol::LobsterInstance::new("ws://localhost:9100".to_string());
-        instance.status = crate::protocol::ConnectionStatus::Connected;
-        instance.state.tasks.summary.completed = 5;
-        instance.state.tasks.summary.in_progress = 2;
-        instance.state.tasks.summary.pending = 3;
-        instance.state.message_queues.inbox.count = 4;
-        // Should render without panicking
-        draw_3d_visualization(&mut scene, 0.0, 0.0, 800.0, 400.0, &instance, 1.0, None);
-    }
-
-    #[test]
-    fn test_3d_visualization_disconnected_demo() {
-        let mut scene = Scene::new();
-        let instance = crate::protocol::LobsterInstance::new("ws://localhost:9100".to_string());
-        // When disconnected, should show demo geometry
-        draw_3d_visualization(&mut scene, 0.0, 0.0, 800.0, 400.0, &instance, 1.0, None);
-    }
-
-    #[test]
-    fn test_3d_visualization_with_sessions() {
-        let mut scene = Scene::new();
-        let mut instance = crate::protocol::LobsterInstance::new("ws://localhost:9100".to_string());
-        instance.status = crate::protocol::ConnectionStatus::Connected;
-        instance.state.sessions = vec![
-            crate::protocol::Session {
-                pid: 1234,
-                name: "claude".to_string(),
-                cmdline: "claude".to_string(),
-                started: None,
-                cpu_percent: 10.0,
-                memory_mb: 256.0,
-            },
-            crate::protocol::Session {
-                pid: 5678,
-                name: "claude".to_string(),
-                cmdline: "claude".to_string(),
-                started: None,
-                cpu_percent: 5.0,
-                memory_mb: 512.0,
-            },
-        ];
-        draw_3d_visualization(&mut scene, 0.0, 0.0, 800.0, 400.0, &instance, 2.5, None);
+        render_dashboard(&mut scene, 1280.0, 800.0, &instances, 100.0, None, &VoiceUiState::Idle, false, &DesignTokens::default());
     }
 
     // --- Ulysses quote test ---
@@ -2192,41 +1494,5 @@ mod tests {
         assert!(!ULYSSES_QUOTE.is_empty(), "Ulysses quote should not be empty");
         assert!(ULYSSES_QUOTE.contains("yes"), "Quote should contain 'yes'");
         assert!(ULYSSES_QUOTE.ends_with("Yes."), "Quote should end with 'Yes.'");
-    }
-
-    // --- Layout split ratio tests ---
-
-    #[test]
-    fn test_single_instance_split_ratio() {
-        // In single instance mode, info panel gets 45%, 3D viz gets 55%
-        let content_width = 1000.0;
-        let split = 0.45;
-        let info_w = content_width * split - PANEL_GAP * 0.5;
-        let viz_w = content_width * (1.0 - split) - PANEL_GAP * 0.5;
-
-        assert!(info_w > 0.0, "Info panel width should be positive");
-        assert!(viz_w > 0.0, "Viz panel width should be positive");
-        assert!(viz_w > info_w, "Viz panel should be wider than info panel");
-        assert!((info_w + viz_w + PANEL_GAP - content_width).abs() < 0.01,
-            "Panels should fill the content width");
-    }
-
-    #[test]
-    fn test_multi_instance_grid_cols() {
-        // 1 instance -> 1 col
-        let cols1 = if 1 <= 1 { 1 } else if 1 <= 4 { 2 } else { 3 };
-        assert_eq!(cols1, 1);
-
-        // 2 instances -> 2 cols
-        let cols2 = if 2 <= 1 { 1 } else if 2 <= 4 { 2 } else { 3 };
-        assert_eq!(cols2, 2);
-
-        // 4 instances -> 2 cols
-        let cols4 = if 4 <= 1 { 1 } else if 4 <= 4 { 2 } else { 3 };
-        assert_eq!(cols4, 2);
-
-        // 5 instances -> 3 cols
-        let cols5 = if 5 <= 1 { 1 } else if 5 <= 4 { 2 } else { 3 };
-        assert_eq!(cols5, 3);
     }
 }

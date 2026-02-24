@@ -12,7 +12,9 @@
 
 use anyhow::Result;
 use statig::prelude::*;
-use tracing::{error, info};
+use std::sync::Arc;
+use tracing::{error, info, warn};
+use whisper_rs::WhisperContext;
 
 use crate::voice::{RecordingState, VoiceConfig, VoiceUiState};
 
@@ -46,12 +48,14 @@ pub enum VoiceEvent {
 /// Shared storage for the voice state machine.
 ///
 /// Holds the resources that must persist across transitions:
-/// - `config`: immutable voice settings (whisper host, etc.)
+/// - `config`: immutable voice settings (model path, etc.)
 /// - `recording`: live capture handle; `Some` only in `Recording` state
+/// - `whisper_ctx`: cached WhisperContext to avoid reloading the model
 /// - `transcription_tx/rx`: channel bridging the async task back to the event loop
 pub struct VoiceMachine {
     pub config: VoiceConfig,
     pub recording: Option<RecordingState>,
+    pub whisper_ctx: Option<Arc<WhisperContext>>,
     pub transcription_tx:
         std::sync::mpsc::SyncSender<Result<crate::voice::TranscriptionResult, String>>,
     pub transcription_rx:
@@ -68,9 +72,27 @@ impl VoiceMachine {
     ) -> Self {
         let (transcription_tx, transcription_rx) =
             std::sync::mpsc::sync_channel::<Result<crate::voice::TranscriptionResult, String>>(4);
+
+        // Eagerly load the whisper model if voice is enabled.
+        let whisper_ctx = if config.enabled {
+            match crate::voice::load_whisper_context(&config.whisper_model) {
+                Ok(ctx) => {
+                    info!(target: "voice", model = %config.whisper_model, "Whisper model loaded");
+                    Some(Arc::new(ctx))
+                }
+                Err(e) => {
+                    warn!(target: "voice", "Failed to load whisper model: {}. Transcription will fail.", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Self {
             config,
             recording: None,
+            whisper_ctx,
             transcription_tx,
             transcription_rx,
             rt_handle,
@@ -79,8 +101,6 @@ impl VoiceMachine {
     }
 
     /// Return a `VoiceUiState` snapshot for rendering.
-    ///
-    /// Reads the current state variant without mutating anything.
     pub fn ui_state(state: &State) -> VoiceUiState {
         match state {
             State::Disabled {} => VoiceUiState::Idle,
@@ -194,7 +214,8 @@ impl VoiceMachine {
     fn done(&mut self, event: &VoiceEvent, text: &String) -> Outcome<State> {
         let _ = text; // used only for rendering via ui_state()
         match event {
-            VoiceEvent::Reset | VoiceEvent::ShiftEnterPressed => Transition(State::idle()),
+            VoiceEvent::Reset => Transition(State::idle()),
+            VoiceEvent::ShiftEnterPressed => Transition(State::recording()),
             _ => Super,
         }
     }
@@ -204,7 +225,8 @@ impl VoiceMachine {
     fn error(&mut self, event: &VoiceEvent, msg: &String) -> Outcome<State> {
         let _ = msg;
         match event {
-            VoiceEvent::Reset | VoiceEvent::ShiftEnterPressed => Transition(State::idle()),
+            VoiceEvent::Reset => Transition(State::idle()),
+            VoiceEvent::ShiftEnterPressed => Transition(State::recording()),
             _ => Super,
         }
     }
@@ -230,7 +252,7 @@ impl VoiceMachine {
         }
     }
 
-    /// Stop cpal audio capture and spawn the async transcription task.
+    /// Stop cpal audio capture and spawn the transcription task.
     /// Called on exit from `Recording`.
     #[action]
     fn exit_recording(&mut self) {
@@ -239,22 +261,36 @@ impl VoiceMachine {
             None => return,
         };
 
+        let whisper_ctx = match &self.whisper_ctx {
+            Some(ctx) => Arc::clone(ctx),
+            None => {
+                let _ = self.transcription_tx.send(Err(
+                    "Whisper model not loaded. Cannot transcribe.".to_string(),
+                ));
+                return;
+            }
+        };
+
         let samples = crate::voice::stop_and_collect(&rec);
         let sample_rate = rec.sample_rate;
         let channels = rec.channels;
-        let config = self.config.clone();
         let tx = self.transcription_tx.clone();
 
+        // Run whisper inference on a blocking thread to avoid blocking the event loop.
         self.rt_handle.spawn(async move {
-            let result: Result<crate::voice::TranscriptionResult, String> = async {
-                let wav = crate::voice::encode_to_wav(&samples, sample_rate, channels)
-                    .map_err(|e| e.to_string())?;
-                crate::voice::transcribe(wav, &config)
-                    .await
+            let result = tokio::task::spawn_blocking(move || {
+                let audio =
+                    crate::voice::prepare_audio_for_whisper(&samples, sample_rate, channels);
+                crate::voice::transcribe_local(&whisper_ctx, &audio)
                     .map_err(|e| e.to_string())
-            }
+            })
             .await;
-            let _ = tx.send(result);
+
+            let send_result = match result {
+                Ok(inner) => inner,
+                Err(e) => Err(format!("Transcription task panicked: {}", e)),
+            };
+            let _ = tx.send(send_result);
         });
 
         info!(target: "voice", "Recording stopped, transcribing...");

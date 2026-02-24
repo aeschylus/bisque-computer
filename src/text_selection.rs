@@ -212,20 +212,23 @@ impl SelectableText {
     ///
     /// `text_color` is the foreground color for unselected text.
     /// `selection_color` is the fill color for selection highlight rects.
+    /// If `highlights_only` is true, only selection highlight rects are drawn
+    /// (text is assumed to be rendered elsewhere, e.g. by the dashboard).
     pub fn render_into_scene(
         &mut self,
         scene: &mut Scene,
         text_color: Color,
         selection_color: Color,
         ctx: &mut ParleyCtx,
+        highlights_only: bool,
     ) {
         let (ox, oy) = self.origin;
         let transform = Affine::translate((ox, oy));
 
+        // Ensure layout is computed (needed for selection geometry).
+        let _ = self.editor.layout(&mut ctx.font_cx, &mut ctx.layout_cx);
+
         // --- Selection highlight rects ---
-        // Collect highlight rects before borrowing the layout so the two
-        // `self.editor` borrows do not overlap.
-        // parley::BoundingBox uses x0, y0, x1, y1 fields.
         let mut highlight_rects: Vec<Rect> = Vec::new();
         self.editor.selection_geometry_with(|bbox, _style_idx| {
             highlight_rects.push(Rect::new(
@@ -237,6 +240,10 @@ impl SelectableText {
         });
         for rect in &highlight_rects {
             scene.fill(Fill::NonZero, transform, selection_color, None, rect);
+        }
+
+        if highlights_only {
+            return;
         }
 
         // --- Glyph runs ---
@@ -251,11 +258,7 @@ impl SelectableText {
                 let font_size = glyph_run.run().font_size();
                 let style = glyph_run.style();
 
-                // Use the style brush color, falling back to text_color.
-                // style.brush is `ColorBrush` (not Option); `.0` extracts the Color.
                 let brush_color = style.brush.0;
-                // If brush is default (opaque black from Default::default()), use
-                // the caller-supplied text_color so the caller can override it.
                 let effective_color = if brush_color == ColorBrush::default().0 {
                     text_color
                 } else {

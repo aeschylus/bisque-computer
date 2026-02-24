@@ -32,9 +32,11 @@
 //! instances, backed by `parley::PlainEditor`.
 
 mod dashboard;
+#[allow(dead_code)]
 mod design;
 mod info_screen;
 mod logging;
+mod pane_tree;
 #[allow(dead_code)]
 mod protocol;
 mod state_machine;
@@ -70,7 +72,7 @@ use state_machine::{AppModeEvent, AppModeMachine, VoiceEvent, VoiceMachine};
 use state_machine::voice_sm::State as VoiceState;
 use state_machine::app_mode_sm::State as AppModeState;
 use design::DesignTokens;
-use terminal::TerminalPane;
+use pane_tree::PaneTree;
 use text_selection::{ParleyCtx, SelectableText};
 
 // ---------------------------------------------------------------------------
@@ -250,7 +252,7 @@ struct App {
     last_frame: Instant,
 
     // --- Terminal ---
-    terminal: Option<TerminalPane>,
+    pane_tree: Option<PaneTree>,
     /// Last cursor blink instant.
     last_blink: Instant,
 }
@@ -289,7 +291,7 @@ impl App {
         }
     }
 
-    fn rebuild_selectable_regions(&mut self, width: f64) {
+    fn rebuild_selectable_regions(&mut self, width: f64, height: f64) {
         self.selectable_regions.clear();
 
         let instances = {
@@ -301,30 +303,13 @@ impl App {
             v
         };
 
-        for (i, inst) in instances.iter().enumerate() {
-            let text = format!(
-                "{} — {}",
-                inst.url,
-                match &inst.status {
-                    crate::protocol::ConnectionStatus::Connected =>
-                        inst.state.system.hostname.clone(),
-                    crate::protocol::ConnectionStatus::Connecting =>
-                        "connecting...".to_string(),
-                    crate::protocol::ConnectionStatus::Disconnected =>
-                        "disconnected".to_string(),
-                    crate::protocol::ConnectionStatus::Error(e) =>
-                        format!("error: {}", &e[..e.len().min(40)]),
-                }
-            );
-
-            let origin = (24.0, 80.0 + i as f64 * 60.0);
-            let max_w = (width - 48.0) as f32;
-
+        let specs = dashboard::compute_selectable_regions(&instances, width, height);
+        for spec in specs {
             let region = SelectableText::new(
-                &text,
-                28.0,
-                origin,
-                Some(max_w),
+                &spec.text,
+                spec.font_size,
+                spec.origin,
+                spec.max_width,
                 &mut self.parley_ctx,
             );
             self.selectable_regions.push(region);
@@ -434,9 +419,9 @@ impl ApplicationHandler for App {
                     if size.width != 0 && size.height != 0 {
                         self.context.resize_surface(surface, size.width, size.height);
                         *valid_surface = true;
-                        // Notify terminal of new size.
-                        if let Some(term) = &mut self.terminal {
-                            term.resize(size.width as f64, size.height as f64);
+                        // Notify terminal pane tree of new size.
+                        if let Some(tree) = &mut self.pane_tree {
+                            tree.resize_all(size.width as f64, size.height as f64);
                         }
                     } else {
                         *valid_surface = false;
@@ -511,6 +496,169 @@ impl ApplicationHandler for App {
             }
 
             // ----------------------------------------------------------------
+            // Terminal screen: pane management (Cmd+D, Cmd+Shift+D, Cmd+W, Cmd+], Cmd+[)
+            // ----------------------------------------------------------------
+
+            // Cmd+D (no shift) — vertical split
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        logical_key: Key::Character(ref c),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } if self.current_screen == ScreenIndex::Terminal
+                && self.modifiers.state().super_key()
+                && !self.modifiers.state().shift_key()
+                && (c.as_str() == "d" || c.as_str() == "D") =>
+            {
+                if let (Some(tree), RenderState::Active { surface, .. }) = (&mut self.pane_tree, &self.render_state) {
+                    let w = surface.config.width as f64;
+                    let h = surface.config.height as f64;
+                    tree.split_focused(pane_tree::SplitDirection::Vertical, w, h);
+                }
+            }
+
+            // Cmd+Shift+D — horizontal split
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        logical_key: Key::Character(ref c),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } if self.current_screen == ScreenIndex::Terminal
+                && self.modifiers.state().super_key()
+                && self.modifiers.state().shift_key()
+                && (c.as_str() == "d" || c.as_str() == "D") =>
+            {
+                if let (Some(tree), RenderState::Active { surface, .. }) = (&mut self.pane_tree, &self.render_state) {
+                    let w = surface.config.width as f64;
+                    let h = surface.config.height as f64;
+                    tree.split_focused(pane_tree::SplitDirection::Horizontal, w, h);
+                }
+            }
+
+            // Cmd+W — close focused pane
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        logical_key: Key::Character(ref c),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } if self.current_screen == ScreenIndex::Terminal
+                && self.modifiers.state().super_key()
+                && (c.as_str() == "w" || c.as_str() == "W") =>
+            {
+                if let Some(tree) = &mut self.pane_tree {
+                    if !tree.close_focused() {
+                        // Last pane closed — show placeholder.
+                        self.pane_tree = None;
+                    }
+                }
+            }
+
+            // Cmd+] — cycle focus forward
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        logical_key: Key::Character(ref c),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } if self.current_screen == ScreenIndex::Terminal
+                && self.modifiers.state().super_key()
+                && c.as_str() == "]" =>
+            {
+                if let Some(tree) = &mut self.pane_tree {
+                    tree.cycle_focus(true);
+                }
+            }
+
+            // Cmd+[ — cycle focus backward
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        logical_key: Key::Character(ref c),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } if self.current_screen == ScreenIndex::Terminal
+                && self.modifiers.state().super_key()
+                && c.as_str() == "[" =>
+            {
+                if let Some(tree) = &mut self.pane_tree {
+                    tree.cycle_focus(false);
+                }
+            }
+
+            // Cmd+= — increase font size
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        logical_key: Key::Character(ref c),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } if self.current_screen == ScreenIndex::Terminal
+                && self.modifiers.state().super_key()
+                && (c.as_str() == "=" || c.as_str() == "+") =>
+            {
+                if let Some(tree) = &mut self.pane_tree {
+                    if let Some(term) = tree.focused_mut() {
+                        term.increase_font_size();
+                    }
+                }
+            }
+
+            // Cmd+- — decrease font size
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        logical_key: Key::Character(ref c),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } if self.current_screen == ScreenIndex::Terminal
+                && self.modifiers.state().super_key()
+                && (c.as_str() == "-" || c.as_str() == "_") =>
+            {
+                if let Some(tree) = &mut self.pane_tree {
+                    if let Some(term) = tree.focused_mut() {
+                        term.decrease_font_size();
+                    }
+                }
+            }
+
+            // Cmd+0 — reset font size to default
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        logical_key: Key::Character(ref c),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } if self.current_screen == ScreenIndex::Terminal
+                && self.modifiers.state().super_key()
+                && c.as_str() == "0" =>
+            {
+                if let Some(tree) = &mut self.pane_tree {
+                    if let Some(term) = tree.focused_mut() {
+                        term.reset_font_size();
+                    }
+                }
+            }
+
+            // ----------------------------------------------------------------
             // Terminal screen: keyboard → PTY
             // ----------------------------------------------------------------
             WindowEvent::KeyboardInput {
@@ -522,12 +670,14 @@ impl ApplicationHandler for App {
                     },
                 ..
             } if self.current_screen == ScreenIndex::Terminal => {
-                // Cmd+Left/Right are consumed above, so anything reaching here
-                // that is NOT a Cmd+Arrow goes to the PTY.
+                // Cmd+Left/Right and pane management keys are consumed above,
+                // so anything reaching here that is NOT a Cmd key goes to the PTY.
                 if !self.modifiers.state().super_key() {
                     let ctrl = self.modifiers.state().control_key();
-                    if let Some(term) = &mut self.terminal {
-                        term.write_key(logical_key, ctrl);
+                    if let Some(tree) = &mut self.pane_tree {
+                        if let Some(term) = tree.focused_mut() {
+                            term.write_key(logical_key, ctrl);
+                        }
                     }
                 }
             }
@@ -561,17 +711,6 @@ impl ApplicationHandler for App {
                     match save_server_url(&url) {
                         Ok(()) => {
                             info!(target: "setup", "Saved server URL: {}", url);
-
-                            if let Ok(parsed) = url::Url::parse(&url) {
-                                if let Some(h) = parsed.host_str() {
-                                    // SAFETY: we are not inside a statig state handler.
-                                    unsafe {
-                                        self.voice_machine.inner_mut().config.whisper_host =
-                                            h.to_string();
-                                    }
-                                    info!(target: "setup", "whisper host set to: {}", h);
-                                }
-                            }
 
                             // SAFETY: we are not inside a statig state handler.
                             unsafe {
@@ -750,18 +889,21 @@ impl ApplicationHandler for App {
                 self.poll_transcription();
 
                 // Drain PTY output before rendering.
-                if let Some(term) = &mut self.terminal {
-                    term.drain_output();
+                if let Some(tree) = &mut self.pane_tree {
+                    tree.drain_all_output();
                 }
 
-                // Acquire design tokens for this frame.
-                let tokens = self.tokens.read().unwrap();
+                // Read cursor blink interval from tokens, then drop the lock
+                // so we can call &mut self methods below.
+                let cursor_blink_ms = self.tokens.read().unwrap().animation.cursor_blink_ms;
 
-                // Cursor blink.
+                // Cursor blink (focused pane only).
                 let blink_elapsed = self.last_blink.elapsed();
-                if blink_elapsed >= std::time::Duration::from_millis(tokens.animation.cursor_blink_ms) {
-                    if let Some(term) = &mut self.terminal {
-                        term.cursor_visible = !term.cursor_visible;
+                if blink_elapsed >= std::time::Duration::from_millis(cursor_blink_ms) {
+                    if let Some(tree) = &mut self.pane_tree {
+                        if let Some(term) = tree.focused_mut() {
+                            term.cursor_visible = !term.cursor_visible;
+                        }
                     }
                     self.last_blink = Instant::now();
                 }
@@ -776,6 +918,23 @@ impl ApplicationHandler for App {
                     self.app_mode_machine.state(),
                     AppModeState::Setup {}
                 );
+
+                // Extract surface dimensions before taking the mutable borrow,
+                // so we can rebuild selectable regions without borrow conflicts.
+                let (surf_width, surf_height) = match &self.render_state {
+                    RenderState::Active { surface, valid_surface: true, .. } => {
+                        (surface.config.width as f64, surface.config.height as f64)
+                    }
+                    _ => return,
+                };
+
+                // Rebuild selectable text regions so they match current data.
+                if !is_setup {
+                    self.rebuild_selectable_regions(surf_width, surf_height);
+                }
+
+                // Now acquire design tokens for the render pass.
+                let tokens = self.tokens.read().unwrap();
 
                 let RenderState::Active {
                     surface,
@@ -843,6 +1002,7 @@ impl ApplicationHandler for App {
                                 text_color,
                                 selection_color,
                                 parley_ctx,
+                                true, // highlights only — dashboard draws the text
                             );
                         }
                     }
@@ -871,10 +1031,10 @@ impl ApplicationHandler for App {
 
                     // --- Screen 2: Terminal ---
                     let mut terminal_scene = Scene::new();
-                    if let Some(term) = &self.terminal {
-                        term.render_into_scene(&mut terminal_scene, 0.0, 0.0, width, height, &tokens);
+                    if let Some(tree) = &self.pane_tree {
+                        tree.render_into_scene(&mut terminal_scene, 0.0, 0.0, width, height);
                     } else {
-                        // Terminal not yet spawned; show a placeholder.
+                        // No terminal panes; show a placeholder.
                         render_terminal_placeholder(&mut terminal_scene, width, height, self.font_data.as_ref());
                     }
                     self.scene.append(
@@ -966,9 +1126,9 @@ fn render_terminal_placeholder(scene: &mut Scene, width: f64, height: f64, font_
     use vello::kurbo::Rect;
     use vello::peniko::{Color, Fill};
     use vello::kurbo::Affine;
-    let bg = Color::new([0.08, 0.08, 0.10, 1.0]);
+    let bg = Color::new([1.0, 0.894, 0.769, 1.0]); // bisque
     scene.fill(Fill::NonZero, Affine::IDENTITY, bg, None, &Rect::new(0.0, 0.0, width, height));
-    let fg = Color::new([0.85, 0.85, 0.90, 1.0]);
+    let fg = Color::new([0.0, 0.0, 0.0, 1.0]); // black
     dashboard::draw_centered_text_pub(scene, width, height, "Terminal (loading...)", fg, 32.0, font_data);
 }
 
@@ -1010,14 +1170,6 @@ fn main() -> Result<()> {
     if args.no_voice {
         voice_config.enabled = false;
     }
-    if !start_in_setup && !endpoints.is_empty() {
-        if let Ok(parsed) = url::Url::parse(&endpoints[0]) {
-            if let Some(h) = parsed.host_str() {
-                voice_config.whisper_host = h.to_string();
-            }
-        }
-    }
-
     let (instances, outbound) = ws_client::spawn_clients(&runtime, endpoints);
 
     let font_data = dashboard::load_readable_font();
@@ -1031,8 +1183,7 @@ fn main() -> Result<()> {
 
     if voice_config.enabled {
         info!(
-            whisper_host = %voice_config.whisper_host,
-            whisper_port = voice_config.whisper_port,
+            whisper_model = %voice_config.whisper_model,
             "Voice input: enabled (Shift+Enter to record, V to toggle)"
         );
     } else {
@@ -1065,10 +1216,10 @@ fn main() -> Result<()> {
         initialized.into()
     };
 
-    // Spawn terminal pane.
+    // Spawn terminal pane tree with a local PTY shell.
     // Use a reasonable default size; will be resized when window is available.
-    let terminal = TerminalPane::spawn(1280.0, 800.0);
-    if terminal.is_some() {
+    let pane_tree = PaneTree::new(1280.0, 800.0);
+    if pane_tree.is_some() {
         info!("Terminal: spawned PTY-backed terminal (Cascadia Code embedded)");
     } else {
         warn!("Terminal: failed to spawn PTY — terminal screen will show placeholder");
@@ -1114,7 +1265,7 @@ fn main() -> Result<()> {
         target_offset: 0.0,
         animating: false,
         last_frame: now,
-        terminal,
+        pane_tree,
         last_blink: now,
     };
 
