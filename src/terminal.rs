@@ -31,13 +31,16 @@
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
+use std::time::Instant;
+
 use alacritty_terminal::Term;
 use alacritty_terminal::event::EventListener;
-use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::Config;
 use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::TermMode;
 use alacritty_terminal::vte::ansi::{Color as AlaColor, NamedColor, Processor, Rgb};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tokio::sync::mpsc as tokio_mpsc;
@@ -61,9 +64,24 @@ const TERM_CURSOR: Color = Color::new([0.40, 0.26, 0.13, 0.85]);
 
 /// Selection highlight color.
 const TERM_SELECTION: Color = Color::new([0.2, 0.5, 1.0, 0.35]);
+/// Hyperlink underline color (subtle blue).
+const TERM_HYPERLINK: Color = Color::new([0.2, 0.4, 0.8, 0.7]);
+/// Hyperlink underline thickness.
+const HYPERLINK_UNDERLINE_PX: f64 = 1.0;
 
 /// Horizontal padding (one cell width on each side).
 const TERM_PAD_CELLS: usize = 1;
+
+/// Mouse encoding scheme reported by the terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseEncoding {
+    /// Normal/X10 encoding (limited to 223 columns/rows).
+    Normal,
+    /// UTF-8 encoding.
+    Utf8,
+    /// SGR encoding (unlimited coordinates, recommended).
+    Sgr,
+}
 
 /// Monaco font stack paths (code/mono font per style guide).
 const MONO_FONT_PATHS: &[&str] = &[
@@ -193,6 +211,14 @@ pub struct TerminalPane {
 
     /// Whether a mouse drag selection is in progress.
     selecting: bool,
+
+    /// Click-counting state for double/triple click detection.
+    last_click_time: Instant,
+    last_click_cell: (usize, usize),
+    click_count: u8,
+
+    /// Viewport cell under the mouse cursor (for hyperlink hover detection).
+    hover_cell: Option<(usize, usize)>,
 }
 
 impl TerminalPane {
@@ -279,6 +305,10 @@ impl TerminalPane {
             rows,
             cursor_visible: true,
             selecting: false,
+            last_click_time: Instant::now(),
+            last_click_cell: (0, 0),
+            click_count: 0,
+            hover_cell: None,
         })
     }
 
@@ -366,6 +396,10 @@ impl TerminalPane {
             rows,
             cursor_visible: true,
             selecting: false,
+            last_click_time: Instant::now(),
+            last_click_cell: (0, 0),
+            click_count: 0,
+            hover_cell: None,
         })
     }
 
@@ -403,6 +437,10 @@ impl TerminalPane {
             rows,
             cursor_visible: true,
             selecting: false,
+            last_click_time: Instant::now(),
+            last_click_cell: (0, 0),
+            click_count: 0,
+            hover_cell: None,
         }
     }
 
@@ -467,7 +505,11 @@ impl TerminalPane {
     /// Should be called when the terminal screen is active and a key is pressed.
     /// Returns `true` if the key was consumed (written to the PTY).
     pub fn write_key(&mut self, key: &Key, ctrl_held: bool) -> bool {
-        let bytes = key_event_to_pty_bytes(key, ctrl_held);
+        let app_cursor = {
+            let term = self.term.lock().unwrap();
+            term.mode().contains(TermMode::APP_CURSOR)
+        };
+        let bytes = key_event_to_pty_bytes(key, ctrl_held, app_cursor);
         if bytes.is_empty() {
             return false;
         }
@@ -531,25 +573,177 @@ impl TerminalPane {
         Point::new(Line(line), Column(col))
     }
 
+    /// Update the hover cell position (for hyperlink underline rendering).
+    pub fn update_hover(&mut self, x: f64, y: f64, offset_x: f64, offset_y: f64) {
+        let (col, row, _side) = self.pixel_to_viewport(x, y, offset_x, offset_y);
+        self.hover_cell = Some((col, row));
+    }
+
+    /// Clear the hover cell (mouse left the terminal area).
+    pub fn clear_hover(&mut self) {
+        self.hover_cell = None;
+    }
+
+    /// Get the URI of the hyperlink under the current hover cell, if any.
+    pub fn hyperlink_at_hover(&self) -> Option<String> {
+        let (col, row) = self.hover_cell?;
+        let term = self.term.lock().unwrap();
+        let display_offset = term.grid().display_offset();
+        let point = Self::viewport_to_grid_point(col, row, display_offset);
+        let cell = &term.grid()[point];
+        cell.hyperlink().map(|h| h.uri().to_owned())
+    }
+
+    /// Get the hyperlink ID at the hover cell, to detect contiguous hyperlink spans.
+    fn hyperlink_id_at_point(&self, term: &Term<TermEventListener>, col: usize, row: usize, display_offset: usize) -> Option<String> {
+        let point = Self::viewport_to_grid_point(col, row, display_offset);
+        let cell = &term.grid()[point];
+        cell.hyperlink().map(|h| h.id().to_owned())
+    }
+
+    // -----------------------------------------------------------------
+    // Mode query convenience methods
+    // -----------------------------------------------------------------
+
+    /// Whether the terminal is on the alternate screen (e.g. vim, less).
+    pub fn is_alt_screen(&self) -> bool {
+        let term = self.term.lock().unwrap();
+        term.mode().contains(TermMode::ALT_SCREEN)
+    }
+
+    /// Whether bracketed paste mode is enabled.
+    pub fn bracketed_paste_enabled(&self) -> bool {
+        let term = self.term.lock().unwrap();
+        term.mode().contains(TermMode::BRACKETED_PASTE)
+    }
+
+    /// Whether application cursor mode is enabled (SS3 arrow keys).
+    pub fn app_cursor_enabled(&self) -> bool {
+        let term = self.term.lock().unwrap();
+        term.mode().contains(TermMode::APP_CURSOR)
+    }
+
+    /// Whether any mouse reporting mode is active.
+    fn mouse_mode(&self) -> bool {
+        let term = self.term.lock().unwrap();
+        term.mode().intersects(TermMode::MOUSE_MODE)
+    }
+
+    /// Whether the terminal wants drag events reported.
+    fn mouse_drag_mode(&self) -> bool {
+        let term = self.term.lock().unwrap();
+        term.mode().intersects(TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION)
+    }
+
+    /// The mouse encoding in use (SGR, UTF-8, or Normal/X10).
+    pub fn mouse_encoding(&self) -> MouseEncoding {
+        let term = self.term.lock().unwrap();
+        let mode = *term.mode();
+        if mode.contains(TermMode::SGR_MOUSE) {
+            MouseEncoding::Sgr
+        } else if mode.contains(TermMode::UTF8_MOUSE) {
+            MouseEncoding::Utf8
+        } else {
+            MouseEncoding::Normal
+        }
+    }
+
+    /// Send a mouse event to the PTY using SGR or normal encoding.
+    ///
+    /// `button`: 0=left, 1=middle, 2=right, 64=scroll up, 65=scroll down
+    /// `col`/`row`: 0-based cell coordinates
+    /// `pressed`: true for press, false for release
+    fn send_mouse_event(&mut self, button: u8, col: usize, row: usize, pressed: bool) {
+        let (sgr, _utf8) = {
+            let term = self.term.lock().unwrap();
+            let mode = *term.mode();
+            (
+                mode.contains(TermMode::SGR_MOUSE),
+                mode.contains(TermMode::UTF8_MOUSE),
+            )
+        };
+
+        if sgr {
+            // SGR encoding: \x1b[<btn;col+1;row+1;M (press) or m (release)
+            let suffix = if pressed { 'M' } else { 'm' };
+            let seq = format!("\x1b[<{};{};{}{}", button, col + 1, row + 1, suffix);
+            let _ = self.pty_writer.write_all(seq.as_bytes());
+        } else {
+            // Normal X10 encoding: \x1b[M btn+32 col+33 row+33
+            // (release is button 3 in normal mode)
+            let btn_byte = if pressed { button + 32 } else { 3 + 32 };
+            let col_byte = (col as u8).saturating_add(33).min(255);
+            let row_byte = (row as u8).saturating_add(33).min(255);
+            let seq = [0x1b, b'[', b'M', btn_byte, col_byte, row_byte];
+            let _ = self.pty_writer.write_all(&seq);
+        }
+        let _ = self.pty_writer.flush();
+    }
+
+    /// Maximum time between clicks for multi-click detection (ms).
+    const MULTI_CLICK_THRESHOLD_MS: u128 = 500;
+
     /// Start a selection at the given pixel position.
     ///
     /// `offset_x` / `offset_y` are the top-left of the terminal area in window coords.
+    /// Tracks click count: single click = Simple, double = Semantic (word),
+    /// triple = Lines (full line).
+    ///
+    /// If the terminal has mouse reporting enabled, sends mouse press events
+    /// to the PTY instead of starting a selection.
     pub fn mouse_press(&mut self, x: f64, y: f64, offset_x: f64, offset_y: f64) {
         let (col, row, side) = self.pixel_to_viewport(x, y, offset_x, offset_y);
+
+        // If the terminal app wants mouse events, send them to the PTY.
+        if self.mouse_mode() {
+            self.send_mouse_event(0, col, row, true);
+            self.selecting = false;
+            return;
+        }
+
+        // Click counting: increment if same cell and within time threshold.
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_click_time).as_millis();
+        if elapsed < Self::MULTI_CLICK_THRESHOLD_MS
+            && self.last_click_cell == (col, row)
+        {
+            self.click_count = if self.click_count >= 3 { 1 } else { self.click_count + 1 };
+        } else {
+            self.click_count = 1;
+        }
+        self.last_click_time = now;
+        self.last_click_cell = (col, row);
+
+        let sel_type = match self.click_count {
+            2 => SelectionType::Semantic,
+            3 => SelectionType::Lines,
+            _ => SelectionType::Simple,
+        };
+
         let mut term = self.term.lock().unwrap();
         let display_offset = term.grid().display_offset();
         let point = Self::viewport_to_grid_point(col, row, display_offset);
-        let sel = Selection::new(SelectionType::Simple, point, side);
+        let sel = Selection::new(sel_type, point, side);
         term.selection = Some(sel);
         self.selecting = true;
     }
 
     /// Extend the selection during a drag.
+    ///
+    /// If mouse drag reporting is active, sends drag events to the PTY.
     pub fn mouse_drag(&mut self, x: f64, y: f64, offset_x: f64, offset_y: f64) {
+        let (col, row, side) = self.pixel_to_viewport(x, y, offset_x, offset_y);
+
+        // If the terminal wants drag events, report them.
+        if self.mouse_drag_mode() {
+            // Button 0 + 32 = drag modifier in SGR/normal encoding.
+            self.send_mouse_event(0 + 32, col, row, true);
+            return;
+        }
+
         if !self.selecting {
             return;
         }
-        let (col, row, side) = self.pixel_to_viewport(x, y, offset_x, offset_y);
         let mut term = self.term.lock().unwrap();
         let display_offset = term.grid().display_offset();
         let point = Self::viewport_to_grid_point(col, row, display_offset);
@@ -559,14 +753,92 @@ impl TerminalPane {
     }
 
     /// End the selection on mouse release.
-    pub fn mouse_release(&mut self) {
+    ///
+    /// If mouse reporting is active, sends a release event to the PTY.
+    pub fn mouse_release(&mut self, x: f64, y: f64, offset_x: f64, offset_y: f64) {
+        if self.mouse_mode() {
+            let (col, row, _side) = self.pixel_to_viewport(x, y, offset_x, offset_y);
+            self.send_mouse_event(0, col, row, false);
+        }
         self.selecting = false;
+    }
+
+    /// Scroll the terminal by the given number of lines.
+    ///
+    /// Positive = scroll up (view older content), negative = scroll down.
+    /// On alt screen with ALTERNATE_SCROLL, sends arrow key escapes instead.
+    /// When mouse reporting is active, sends scroll button events.
+    pub fn scroll(&mut self, delta_lines: i32) {
+        if delta_lines == 0 {
+            return;
+        }
+
+        let (is_alt, alt_scroll, has_mouse, app_cursor) = {
+            let term = self.term.lock().unwrap();
+            let mode = *term.mode();
+            (
+                mode.contains(TermMode::ALT_SCREEN),
+                mode.contains(TermMode::ALTERNATE_SCROLL),
+                mode.intersects(TermMode::MOUSE_MODE),
+                mode.contains(TermMode::APP_CURSOR),
+            )
+        };
+
+        if has_mouse {
+            // Send scroll as mouse button events (64=up, 65=down).
+            let button: u8 = if delta_lines > 0 { 64 } else { 65 };
+            let count = delta_lines.unsigned_abs() as usize;
+            for _ in 0..count.min(10) {
+                self.send_mouse_event(button, 0, 0, true);
+            }
+            return;
+        }
+
+        if is_alt && alt_scroll {
+            // On alt screen, convert scroll to arrow key presses.
+            let (key_bytes, count) = if delta_lines > 0 {
+                (if app_cursor { b"\x1bOA" } else { b"\x1b[A" }, delta_lines as usize)
+            } else {
+                (if app_cursor { b"\x1bOB" } else { b"\x1b[B" }, (-delta_lines) as usize)
+            };
+            for _ in 0..count.min(10) {
+                let _ = self.pty_writer.write_all(key_bytes);
+            }
+            let _ = self.pty_writer.flush();
+            return;
+        }
+
+        // Normal mode: scroll the display (scrollback buffer).
+        let mut term = self.term.lock().unwrap();
+        term.scroll_display(Scroll::Delta(delta_lines));
     }
 
     /// Get the currently selected text, if any.
     pub fn selected_text(&self) -> Option<String> {
         let term = self.term.lock().unwrap();
         term.selection_to_string()
+    }
+
+    /// Paste text into the terminal.
+    ///
+    /// Respects bracketed paste mode: wraps text with escape sequences so the
+    /// shell/application can distinguish pasted text from typed input.
+    pub fn paste(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let bracketed = {
+            let term = self.term.lock().unwrap();
+            term.mode().contains(TermMode::BRACKETED_PASTE)
+        };
+        if bracketed {
+            let _ = self.pty_writer.write_all(b"\x1b[200~");
+        }
+        let _ = self.pty_writer.write_all(text.as_bytes());
+        if bracketed {
+            let _ = self.pty_writer.write_all(b"\x1b[201~");
+        }
+        let _ = self.pty_writer.flush();
     }
 
     /// Copy the current selection to the system clipboard.
@@ -612,6 +884,13 @@ impl TerminalPane {
         // The first visible grid line is Line(-(display_offset as i32)).
         let first_visible_line = -(display_offset as i32);
 
+        // Determine the hyperlink ID under the hover cell (if any) for underline highlighting.
+        let hovered_hyperlink_id: Option<String> = self.hover_cell.and_then(|(hcol, hrow)| {
+            let point = Self::viewport_to_grid_point(hcol, hrow, display_offset);
+            let grid_cell = &term.grid()[point];
+            grid_cell.hyperlink().map(|h| h.id().to_owned())
+        });
+
         let mut fg_glyphs: Vec<(Color, Vec<Glyph>)> = Vec::new();
 
         for cell in content.display_iter {
@@ -640,6 +919,20 @@ impl TerminalPane {
                 if sel.contains(cell.point) {
                     let rect = Rect::new(cell_x, cell_y, cell_x + cw, cell_y + ch);
                     scene.fill(Fill::NonZero, Affine::IDENTITY, TERM_SELECTION, None, &rect);
+                }
+            }
+
+            // Draw hyperlink underline if this cell's hyperlink matches the hovered one.
+            if let Some(ref hovered_id) = hovered_hyperlink_id {
+                if let Some(link) = cell.cell.hyperlink() {
+                    if link.id() == hovered_id {
+                        let underline_y = cell_y + ch - 2.0;
+                        let underline_rect = Rect::new(
+                            cell_x, underline_y,
+                            cell_x + cw, underline_y + HYPERLINK_UNDERLINE_PX,
+                        );
+                        scene.fill(Fill::NonZero, Affine::IDENTITY, TERM_HYPERLINK, None, &underline_rect);
+                    }
                 }
             }
 
@@ -814,8 +1107,9 @@ fn indexed_color_fallback(idx: u8) -> Color {
 
 /// Convert a winit keyboard event to the byte sequence to send to the PTY.
 ///
+/// `app_cursor`: when true, arrow keys send SS3 sequences (\x1bO) instead of CSI (\x1b[).
 /// Returns an empty `Vec` if the key has no terminal meaning.
-pub fn key_event_to_pty_bytes(key: &Key, ctrl_held: bool) -> Vec<u8> {
+pub fn key_event_to_pty_bytes(key: &Key, ctrl_held: bool, app_cursor: bool) -> Vec<u8> {
     match key {
         Key::Character(c) => {
             let s = c.as_str();
@@ -846,14 +1140,15 @@ pub fn key_event_to_pty_bytes(key: &Key, ctrl_held: bool) -> Vec<u8> {
             NamedKey::Tab => vec![b'\t'],
             NamedKey::Escape => vec![0x1b],
             NamedKey::Delete => b"\x1b[3~".to_vec(),
-            // Arrow keys (normal cursor mode).
-            NamedKey::ArrowUp => b"\x1b[A".to_vec(),
-            NamedKey::ArrowDown => b"\x1b[B".to_vec(),
-            NamedKey::ArrowRight => b"\x1b[C".to_vec(),
-            NamedKey::ArrowLeft => b"\x1b[D".to_vec(),
+            // Arrow keys: SS3 in app cursor mode, CSI otherwise.
+            NamedKey::ArrowUp    => if app_cursor { b"\x1bOA".to_vec() } else { b"\x1b[A".to_vec() },
+            NamedKey::ArrowDown  => if app_cursor { b"\x1bOB".to_vec() } else { b"\x1b[B".to_vec() },
+            NamedKey::ArrowRight => if app_cursor { b"\x1bOC".to_vec() } else { b"\x1b[C".to_vec() },
+            NamedKey::ArrowLeft  => if app_cursor { b"\x1bOD".to_vec() } else { b"\x1b[D".to_vec() },
+            // Home/End: SS3 in app cursor mode.
+            NamedKey::Home => if app_cursor { b"\x1bOH".to_vec() } else { b"\x1b[H".to_vec() },
+            NamedKey::End  => if app_cursor { b"\x1bOF".to_vec() } else { b"\x1b[F".to_vec() },
             // Navigation keys.
-            NamedKey::Home => b"\x1b[H".to_vec(),
-            NamedKey::End => b"\x1b[F".to_vec(),
             NamedKey::PageUp => b"\x1b[5~".to_vec(),
             NamedKey::PageDown => b"\x1b[6~".to_vec(),
             // Space (winit may emit space as Named(Space) instead of Character(" ")).

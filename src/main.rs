@@ -267,6 +267,26 @@ struct App {
 }
 
 impl App {
+    /// Get the current surface dimensions, if active.
+    fn surface_size(&self) -> Option<(f64, f64)> {
+        match &self.render_state {
+            RenderState::Active { surface, valid_surface: true, .. } => {
+                Some((surface.config.width as f64, surface.config.height as f64))
+            }
+            _ => None,
+        }
+    }
+
+    /// Get the offset `(x, y)` of the focused terminal pane within the window.
+    fn terminal_pane_offset(&self) -> (f64, f64) {
+        if let (Some(tree), Some((w, h))) = (&self.pane_tree, self.surface_size()) {
+            tree.focused_rect(w, h)
+                .map_or((0.0, 0.0), |(x, y, _, _)| (x, y))
+        } else {
+            (0.0, 0.0)
+        }
+    }
+
     fn is_dashboard(&self) -> bool {
         matches!(self.app_mode_machine.state(), AppModeState::Dashboard {})
     }
@@ -873,6 +893,32 @@ impl ApplicationHandler for App {
                 }
             }
 
+            // Cmd+V: paste into terminal.
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        logical_key: Key::Character(ref c),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } if (c.as_str() == "v" || c.as_str() == "V")
+                && self.modifiers.state().super_key()
+                && self.current_screen == ScreenIndex::Terminal =>
+            {
+                if let Some(tree) = &mut self.pane_tree {
+                    if let Some(term) = tree.focused_mut() {
+                        match arboard::Clipboard::new().and_then(|mut cb| cb.get_text()) {
+                            Ok(text) => {
+                                term.paste(&text);
+                                info!(target: "terminal", "Pasted {} chars", text.len());
+                            }
+                            Err(e) => error!(target: "terminal", "Clipboard read failed: {}", e),
+                        }
+                    }
+                }
+            }
+
             // Cmd+C: copy selected text (all screens).
             WindowEvent::KeyboardInput {
                 event:
@@ -923,9 +969,12 @@ impl ApplicationHandler for App {
                         region.handle_mouse_drag(x, y, parley_ctx);
                     }
                 } else if self.current_screen == ScreenIndex::Terminal {
+                    let (ox, oy) = self.terminal_pane_offset();
                     if let Some(tree) = &mut self.pane_tree {
                         if let Some(term) = tree.focused_mut() {
-                            term.mouse_drag(position.x, position.y, 0.0, 0.0);
+                            // Always update hover cell for hyperlink detection.
+                            term.update_hover(position.x, position.y, ox, oy);
+                            term.mouse_drag(position.x, position.y, ox, oy);
                         }
                     }
                 }
@@ -964,19 +1013,60 @@ impl ApplicationHandler for App {
             } if self.current_screen == ScreenIndex::Terminal => {
                 let x = self.cursor_pos.x;
                 let y = self.cursor_pos.y;
+                let (ox, oy) = self.terminal_pane_offset();
                 match btn_state {
                     ElementState::Pressed => {
-                        if let Some(tree) = &mut self.pane_tree {
+                        // Cmd+click: open hyperlink if present.
+                        if self.modifiers.state().super_key() {
+                            if let Some(tree) = &self.pane_tree {
+                                if let Some(term) = tree.focused() {
+                                    if let Some(uri) = term.hyperlink_at_hover() {
+                                        info!(target: "terminal", "Opening hyperlink: {}", uri);
+                                        let _ = std::process::Command::new("open")
+                                            .arg(&uri)
+                                            .spawn();
+                                    }
+                                }
+                            }
+                        } else if let Some(tree) = &mut self.pane_tree {
                             if let Some(term) = tree.focused_mut() {
-                                term.mouse_press(x, y, 0.0, 0.0);
+                                term.mouse_press(x, y, ox, oy);
                             }
                         }
                     }
                     ElementState::Released => {
                         if let Some(tree) = &mut self.pane_tree {
                             if let Some(term) = tree.focused_mut() {
-                                term.mouse_release();
+                                term.mouse_release(x, y, ox, oy);
                             }
+                        }
+                    }
+                }
+            }
+
+            // ----------------------------------------------------------------
+            // Mouse: scroll wheel on terminal
+            // ----------------------------------------------------------------
+            WindowEvent::MouseWheel { delta, .. }
+                if self.current_screen == ScreenIndex::Terminal =>
+            {
+                // Convert pixel or line delta to integer line count.
+                let lines = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_x, y) => {
+                        y.round() as i32
+                    }
+                    winit::event::MouseScrollDelta::PixelDelta(pos) => {
+                        // Approximate: divide by cell height (or a reasonable default).
+                        let cell_h = self.pane_tree.as_ref()
+                            .and_then(|t| t.focused().map(|term| term.cell_height as f64))
+                            .unwrap_or(28.0);
+                        (pos.y / cell_h).round() as i32
+                    }
+                };
+                if lines != 0 {
+                    if let Some(tree) = &mut self.pane_tree {
+                        if let Some(term) = tree.focused_mut() {
+                            term.scroll(lines);
                         }
                     }
                 }

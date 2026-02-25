@@ -244,6 +244,14 @@ impl PaneTree {
     pub fn pane_count(&self) -> usize {
         self.root.as_ref().map_or(0, count_leaves)
     }
+
+    /// Return the bounding rect `(x, y, w, h)` of the focused pane within
+    /// the given total area.
+    pub fn focused_rect(&self, width: f64, height: f64) -> Option<(f64, f64, f64, f64)> {
+        let root = self.root.as_ref()?;
+        let r = rect_at_path(root, &self.focus_path, 0.0, 0.0, width, height);
+        Some((r.x0, r.y0, r.width(), r.height()))
+    }
 }
 
 // ---------------------------------------------------------------------------
