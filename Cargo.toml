@@ -10,7 +10,7 @@ pollster = "0.4.0"
 anyhow = "1.0"
 
 # Async runtime for WebSocket client and process spawning
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "fs", "net", "io-util"] }
 
 # WebSocket client
 tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "handshake"] }
@@ -56,3 +56,15 @@ alacritty_terminal = "0.25"
 
 # File watching for design token hot-reload
 notify = "7"
+
+# HTTP server for POST /drop file upload endpoint (vm drop_server module)
+axum = { version = "0.8", features = ["multipart"] }
+
+[dev-dependencies]
+# Used by vm_integration tests: temporary directories for per-test VM state
+tempfile = "3"
+
+[features]
+# Gate integration tests that require a running VM, vfkit, and macOS.
+# Run with: cargo test --features vm-integration-tests --test vm_integration
+vm-integration-tests = []

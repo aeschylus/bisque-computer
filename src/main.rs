@@ -45,6 +45,8 @@ mod state_machine;
 mod terminal;
 mod text_selection;
 mod token_watcher;
+#[allow(dead_code)]
+mod vm;
 mod voice;
 mod ws_client;
 
