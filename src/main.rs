@@ -46,6 +46,8 @@ mod terminal;
 mod text_selection;
 mod token_watcher;
 mod voice;
+#[allow(dead_code)]
+mod vm;
 mod ws_client;
 
 use anyhow::Result;
