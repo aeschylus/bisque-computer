@@ -59,3 +59,12 @@ notify = "7"
 
 # HTTP server for POST /drop file upload endpoint
 axum = { version = "0.8", features = ["multipart"] }
+
+[dev-dependencies]
+# Used by vm_integration tests: temporary directories for per-test VM state
+tempfile = "3"
+
+[features]
+# Gate integration tests that require a running VM, vfkit, and macOS.
+# Run with: cargo test --features vm-integration-tests --test vm_integration
+vm-integration-tests = []

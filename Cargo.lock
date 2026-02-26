@@ -370,6 +370,7 @@ dependencies = [
  "serde_json",
  "skrifa 0.40.0",
  "statig",
+ "tempfile",
  "tokio",
  "tokio-tungstenite",
  "toml",
