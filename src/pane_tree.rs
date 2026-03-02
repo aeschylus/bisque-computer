@@ -231,6 +231,13 @@ impl PaneTree {
         if let Some(ref mut root) = self.root { drain_recursive(root); }
     }
 
+    /// Propagate a new smoothed RTT value to every `PredictionEngine` in the
+    /// tree. Called once per render frame from the RTT observed on the
+    /// WebSocket ping/pong channel.
+    pub fn set_rtt_all(&mut self, rtt_ms: u32) {
+        if let Some(ref mut root) = self.root { set_rtt_recursive(root, rtt_ms); }
+    }
+
     pub fn resize_all(&mut self, width: f64, height: f64) {
         if let Some(ref mut root) = self.root { resize_recursive(root, width, height); }
     }
@@ -404,6 +411,16 @@ fn drain_recursive(node: &mut PaneNode) {
     match node {
         PaneNode::Leaf(term) => term.drain_output(),
         PaneNode::Split { first, second, .. } => { drain_recursive(first); drain_recursive(second); }
+    }
+}
+
+fn set_rtt_recursive(node: &mut PaneNode, rtt_ms: u32) {
+    match node {
+        PaneNode::Leaf(term) => term.prediction.set_rtt(rtt_ms),
+        PaneNode::Split { first, second, .. } => {
+            set_rtt_recursive(first, rtt_ms);
+            set_rtt_recursive(second, rtt_ms);
+        }
     }
 }
 

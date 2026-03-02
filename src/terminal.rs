@@ -29,12 +29,10 @@
 //! ```
 
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use std::time::Instant;
 
-use crate::app_event::AppEvent;
 use crate::prediction::{KeyEvent as PredKeyEvent, PredictionEngine};
 use alacritty_terminal::Term;
 use alacritty_terminal::event::EventListener;
@@ -1054,19 +1052,9 @@ impl TerminalPane {
         if self.prediction.is_active() {
             let confirmed_epoch = self.prediction.confirmed_epoch();
 
-            // Collect predicted glyph data batched by foreground color.
-            //
-            // For each overlay cell we query the confirmed terminal grid cell at the
-            // same (col, row) position and extract its actual foreground color via
-            // resolve_cell_colors(). This prevents the jarring color flash that
-            // occurs when a prediction is rendered in black (TERM_FG) but the
-            // confirmed cell uses a different color (e.g. colored prompt, syntax
-            // highlighting). We mirror the Phase 1 batching pattern: Vec<(Color,
-            // Vec<Glyph>)>, so that cells sharing the same color are drawn in a
-            // single draw_glyphs() call.
-            let mut predicted_glyph_batches: Vec<(Color, Vec<Glyph>)> = Vec::new();
-            // Underline rectangles paired with their per-cell foreground color.
-            let mut underline_rects: Vec<(Color, Rect)> = Vec::new();
+            // Collect predicted glyph data.
+            let mut predicted_glyphs: Vec<Glyph> = Vec::new();
+            let mut underline_rects: Vec<Rect> = Vec::new();
 
             for ((col, row), overlay_cell) in self.prediction.overlay().visible_cells(confirmed_epoch) {
                 let col = col as usize;
@@ -1077,61 +1065,43 @@ impl TerminalPane {
                 let cell_x = offset_x + col as f64 * cw;
                 let cell_y = offset_y + row as f64 * ch;
 
-                // Determine the foreground color to use for this predicted character.
-                //
-                // Strategy: look up the confirmed grid cell at this (col, row) position
-                // and resolve its foreground color. If the grid lookup fails for any
-                // reason (e.g. the position is out of the scrollback grid bounds) we
-                // fall back to TERM_FG.
-                let overlay_fg_color = {
-                    let grid_point = Self::viewport_to_grid_point(col, row, display_offset);
-                    let grid_cell = &term.grid()[grid_point];
-                    let (_, fg) = resolve_cell_colors(grid_cell, colors);
-                    fg
-                };
-
-                // Accumulate glyph into the batch for this color.
+                // Predicted characters use the same foreground color as normal text.
+                // No background override — they sit on top of whatever confirmed state is below.
                 let font_ref = skrifa::FontRef::from_index(self.font.data.as_ref(), self.font.index);
                 if let Ok(font_ref) = font_ref {
                     use skrifa::MetadataProvider;
                     let charmap = font_ref.charmap();
                     let gid = charmap.map(overlay_cell.ch).unwrap_or_default();
                     let baseline_y = cell_y + ch * 0.8;
-                    let glyph = Glyph {
+                    predicted_glyphs.push(Glyph {
                         id: gid.to_u32(),
                         x: cell_x as f32,
                         y: baseline_y as f32,
-                    };
-                    if let Some(batch) = predicted_glyph_batches.iter_mut().find(|(c, _)| *c == overlay_fg_color) {
-                        batch.1.push(glyph);
-                    } else {
-                        predicted_glyph_batches.push((overlay_fg_color, vec![glyph]));
-                    }
+                    });
                 }
 
                 // Underline the prediction when RTT > 80ms (flagging mode, matches Mosh behavior).
-                // Use the same per-cell color so the underline also matches the confirmed style.
                 if overlay_cell.underlined {
                     let underline_y = cell_y + ch - 2.0;
-                    underline_rects.push((overlay_fg_color, Rect::new(
+                    underline_rects.push(Rect::new(
                         cell_x, underline_y,
                         cell_x + cw, underline_y + HYPERLINK_UNDERLINE_PX,
-                    )));
+                    ));
                 }
             }
 
-            // Flush predicted glyph batches — one draw call per distinct foreground color.
-            for (color, glyphs) in predicted_glyph_batches {
+            // Flush predicted glyphs in a single batch using the default foreground color.
+            if !predicted_glyphs.is_empty() {
                 scene
                     .draw_glyphs(&self.font)
                     .font_size(self.font_size)
-                    .brush(&color)
-                    .draw(Fill::NonZero, glyphs.into_iter());
+                    .brush(&TERM_FG)
+                    .draw(Fill::NonZero, predicted_glyphs.into_iter());
             }
 
-            // Draw underlines for flagged predictions (RTT > 80ms), using per-cell color.
-            for (color, rect) in underline_rects {
-                scene.fill(Fill::NonZero, Affine::IDENTITY, color, None, &rect);
+            // Draw underlines for flagged predictions (RTT > 80ms).
+            for rect in underline_rects {
+                scene.fill(Fill::NonZero, Affine::IDENTITY, TERM_FG, None, &rect);
             }
 
             // Draw the predicted cursor on top of the overlay glyphs.
