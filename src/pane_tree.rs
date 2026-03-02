@@ -9,7 +9,9 @@ use vello::kurbo::{Affine, Rect};
 use vello::peniko::{Color, Fill};
 use vello::Scene;
 
+use crate::app_event::AppEvent;
 use crate::terminal::TerminalPane;
+use winit::event_loop::EventLoopProxy;
 
 /// The Dockerfile embedded in the binary at compile time.
 const DOCKERFILE: &str = include_str!("../docker/Dockerfile");
@@ -114,23 +116,31 @@ pub struct PaneTree {
     focus_path: Vec<FocusChild>,
     /// Backend configuration for spawning new panes.
     backend: TerminalBackend,
+    /// Event-loop proxy for waking the render thread on PTY output.
+    proxy: EventLoopProxy<AppEvent>,
 }
 
 impl PaneTree {
     /// Create a new pane tree with a single terminal pane.
     ///
     /// Uses the `Local` backend by default (existing behavior).
-    pub fn new(width: f64, height: f64) -> Option<Self> {
-        Self::with_backend(width, height, TerminalBackend::Local)
+    pub fn new(width: f64, height: f64, proxy: EventLoopProxy<AppEvent>) -> Option<Self> {
+        Self::with_backend(width, height, TerminalBackend::Local, proxy)
     }
 
     /// Create a new pane tree with a specific backend.
-    pub fn with_backend(width: f64, height: f64, backend: TerminalBackend) -> Option<Self> {
-        let pane = spawn_pane_for_backend(&backend, width, height)?;
+    pub fn with_backend(
+        width: f64,
+        height: f64,
+        backend: TerminalBackend,
+        proxy: EventLoopProxy<AppEvent>,
+    ) -> Option<Self> {
+        let pane = spawn_pane_for_backend(&backend, width, height, proxy.clone())?;
         Some(Self {
             root: Some(PaneNode::Leaf(pane)),
             focus_path: Vec::new(),
             backend,
+            proxy,
         })
     }
 
@@ -157,7 +167,7 @@ impl PaneTree {
             return;
         }
 
-        let new_pane = match spawn_pane_for_backend(&self.backend, second_w, second_h) {
+        let new_pane = match spawn_pane_for_backend(&self.backend, second_w, second_h, self.proxy.clone()) {
             Some(pane) => pane,
             None => {
                 warn!("Failed to spawn new terminal pane for split");
@@ -496,13 +506,14 @@ fn spawn_pane_for_backend(
     backend: &TerminalBackend,
     width: f64,
     height: f64,
+    proxy: EventLoopProxy<AppEvent>,
 ) -> Option<TerminalPane> {
     match backend {
-        TerminalBackend::Local => TerminalPane::spawn(width, height),
+        TerminalBackend::Local => TerminalPane::spawn(width, height, proxy),
         TerminalBackend::Docker => {
             if !ensure_docker_image() {
                 warn!("Docker image unavailable — falling back to local PTY");
-                return TerminalPane::spawn(width, height);
+                return TerminalPane::spawn(width, height, proxy);
             }
 
             info!(image = DOCKER_IMAGE, "Spawning Docker container for Claude Code");
@@ -530,6 +541,7 @@ fn spawn_pane_for_backend(
                 "docker",
                 &args_refs,
                 &[],
+                proxy,
             )
         }
     }
