@@ -31,6 +31,7 @@
 //! Mouse events for text selection are routed through `text_selection::SelectableText`
 //! instances, backed by `parley::PlainEditor`.
 
+mod app_event;
 mod dashboard;
 #[allow(dead_code)]
 mod design;
@@ -68,7 +69,8 @@ use vello::{AaConfig, Renderer, RendererOptions, Scene};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalPosition;
 use winit::event::{ElementState, KeyEvent, Modifiers, MouseButton, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use app_event::AppEvent;
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Fullscreen, Window};
 
@@ -263,6 +265,8 @@ struct App {
 
     // --- Terminal ---
     pane_tree: Option<PaneTree>,
+    /// Event-loop proxy for waking the render thread from background threads.
+    proxy: EventLoopProxy<AppEvent>,
     /// Last cursor blink instant.
     last_blink: Instant,
 
@@ -385,7 +389,7 @@ impl App {
     }
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<AppEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let RenderState::Suspended(cached_window) = &mut self.render_state else {
             return;
@@ -1333,6 +1337,21 @@ impl ApplicationHandler for App {
         }
     }
 
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: AppEvent) {
+        match event {
+            AppEvent::PtyData => {
+                // Drain queued PTY bytes and request an immediate repaint,
+                // bypassing the WaitUntil cursor-blink timer entirely.
+                if let Some(tree) = &mut self.pane_tree {
+                    tree.drain_all_output();
+                }
+                if let RenderState::Active { window, .. } = &self.render_state {
+                    window.request_redraw();
+                }
+            }
+        }
+    }
+
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         // Triggered by WaitUntil expiry (cursor blink) or external wakeup.
         // Re-request a redraw so the terminal cursor blinks.
@@ -1452,14 +1471,19 @@ fn main() -> Result<()> {
         initialized.into()
     };
 
+    // Create the event loop and proxy before spawning the pane tree so the
+    // PTY reader threads can wake the winit event loop when bytes arrive.
+    let event_loop = EventLoop::<AppEvent>::with_user_event().build()?;
+    let proxy = event_loop.create_proxy();
+
     // Spawn terminal pane tree. Use Docker backend when --docker is set,
     // otherwise fall back to a local PTY shell.
     let pane_tree = if args.docker {
         info!("Terminal: using Docker backend");
-        PaneTree::with_backend(1280.0, 800.0, pane_tree::TerminalBackend::Docker)
+        PaneTree::with_backend(1280.0, 800.0, pane_tree::TerminalBackend::Docker, proxy.clone())
     } else {
         info!("Terminal: using local PTY backend");
-        PaneTree::new(1280.0, 800.0)
+        PaneTree::new(1280.0, 800.0, proxy.clone())
     };
     if pane_tree.is_some() {
         info!("Terminal: pane tree spawned successfully");
@@ -1508,11 +1532,11 @@ fn main() -> Result<()> {
         animating: false,
         last_frame: now,
         pane_tree,
+        proxy,
         last_blink: now,
         design_repl: design_repl::DesignRepl::new(),
     };
 
-    let event_loop = EventLoop::new()?;
     event_loop
         .run_app(&mut app)
         .expect("Couldn't run event loop");

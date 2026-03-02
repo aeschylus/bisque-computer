@@ -30,8 +30,12 @@
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use std::time::Instant;
+
+use crate::app_event::AppEvent;
+use winit::event_loop::EventLoopProxy;
 
 use crate::prediction::{KeyEvent as PredKeyEvent, PredictionEngine};
 use alacritty_terminal::Term;
@@ -183,6 +187,12 @@ pub struct TerminalPane {
     /// Buffered PTY output bytes from the reader thread.
     rx: tokio_mpsc::UnboundedReceiver<Vec<u8>>,
 
+    /// Coalescing flag: set by the reader thread when it sends PTY bytes and
+    /// a `PtyData` event. Cleared by `drain_output()` before draining the
+    /// channel, so rapid bursts do not flood the winit event queue with more
+    /// than one in-flight `PtyData` event per pane.
+    pty_dirty: Arc<AtomicBool>,
+
     /// Write handle to the backend (sends input to the shell/VM).
     pty_writer: Box<dyn Write + Send>,
 
@@ -234,7 +244,7 @@ impl TerminalPane {
     ///
     /// `width` and `height` are the pixel dimensions of the terminal area.
     /// Returns `None` if PTY creation or shell spawn fails.
-    pub fn spawn(width: f64, height: f64) -> Option<Self> {
+    pub fn spawn(width: f64, height: f64, proxy: EventLoopProxy<AppEvent>) -> Option<Self> {
         // Build font (Monaco preferred, Cascadia Code fallback) and compute cell dimensions.
         let font_data = load_terminal_font();
         let (cell_width, cell_height) = compute_cell_size(&font_data, DEFAULT_FONT_SIZE);
@@ -274,10 +284,14 @@ impl TerminalPane {
         let reader = pair.master.try_clone_reader().ok()?;
         let writer = pair.master.take_writer().ok()?;
 
-        // Spawn the PTY reader thread.
+        // Spawn the PTY reader thread with event-driven wakeup.
+        // The dirty flag coalesces rapid bursts: only the first byte in each
+        // burst fires a PtyData event; subsequent bytes are silently queued.
+        let dirty = Arc::new(AtomicBool::new(false));
         let (tx, rx) = tokio_mpsc::unbounded_channel::<Vec<u8>>();
         {
             let tx = tx.clone();
+            let dirty_reader = dirty.clone();
             std::thread::spawn(move || {
                 let mut reader = reader;
                 let mut buf = [0u8; 4096];
@@ -286,6 +300,11 @@ impl TerminalPane {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
                             let _ = tx.send(buf[..n].to_vec());
+                            // Only send PtyData on the false→true transition so
+                            // a rapid burst sends at most one wakeup event.
+                            if !dirty_reader.swap(true, Ordering::Relaxed) {
+                                let _ = proxy.send_event(AppEvent::PtyData);
+                            }
                         }
                     }
                 }
@@ -301,6 +320,7 @@ impl TerminalPane {
             term,
             processor: Processor::new(),
             rx,
+            pty_dirty: dirty,
             pty_writer: writer,
             pty_resize: Box::new(LocalPtyResize(pair.master)),
             font: font_data,
@@ -331,6 +351,7 @@ impl TerminalPane {
         cmd: &str,
         args: &[&str],
         env: &[(&str, &str)],
+        proxy: EventLoopProxy<AppEvent>,
     ) -> Option<Self> {
         let font_data = load_terminal_font();
         let (cell_width, cell_height) = compute_cell_size(&font_data, DEFAULT_FONT_SIZE);
@@ -368,9 +389,11 @@ impl TerminalPane {
         let reader = pair.master.try_clone_reader().ok()?;
         let writer = pair.master.take_writer().ok()?;
 
+        let dirty = Arc::new(AtomicBool::new(false));
         let (tx, rx) = tokio_mpsc::unbounded_channel::<Vec<u8>>();
         {
             let tx = tx.clone();
+            let dirty_reader = dirty.clone();
             std::thread::spawn(move || {
                 let mut reader = reader;
                 let mut buf = [0u8; 4096];
@@ -379,6 +402,9 @@ impl TerminalPane {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
                             let _ = tx.send(buf[..n].to_vec());
+                            if !dirty_reader.swap(true, Ordering::Relaxed) {
+                                let _ = proxy.send_event(AppEvent::PtyData);
+                            }
                         }
                     }
                 }
@@ -393,6 +419,7 @@ impl TerminalPane {
             term,
             processor: Processor::new(),
             rx,
+            pty_dirty: dirty,
             pty_writer: writer,
             pty_resize: Box::new(LocalPtyResize(pair.master)),
             font: font_data,
@@ -435,6 +462,8 @@ impl TerminalPane {
             term,
             processor: Processor::new(),
             rx,
+            // VM streams do not have a proxy — use a no-op dirty flag.
+            pty_dirty: Arc::new(AtomicBool::new(false)),
             pty_writer: writer,
             pty_resize: resizer,
             font: font_data,
@@ -469,6 +498,9 @@ impl TerminalPane {
     ///
     /// Must be called from the main thread (render loop) before each frame.
     pub fn drain_output(&mut self) {
+        // Clear the dirty flag BEFORE draining so any bytes that arrive
+        // after the channel appears empty will trigger a fresh PtyData event.
+        self.pty_dirty.store(false, Ordering::Relaxed);
         let mut collected: Vec<Vec<u8>> = Vec::new();
         while let Ok(chunk) = self.rx.try_recv() {
             collected.push(chunk);
