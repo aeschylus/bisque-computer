@@ -33,6 +33,7 @@ use std::sync::{Arc, Mutex};
 
 use std::time::Instant;
 
+use crate::prediction::{KeyEvent as PredKeyEvent, PredictionEngine};
 use alacritty_terminal::Term;
 use alacritty_terminal::event::EventListener;
 use alacritty_terminal::grid::{Dimensions, Scroll};
@@ -219,6 +220,13 @@ pub struct TerminalPane {
 
     /// Viewport cell under the mouse cursor (for hyperlink hover detection).
     hover_cell: Option<(usize, usize)>,
+
+    /// Mosh-style local keystroke prediction engine.
+    ///
+    /// Maintains a sparse overlay of speculatively-rendered characters that are
+    /// painted on top of the confirmed alacritty_terminal state. Inactive below
+    /// 20ms RTT; call `prediction.set_rtt(ms)` to activate.
+    pub prediction: PredictionEngine,
 }
 
 impl TerminalPane {
@@ -309,6 +317,7 @@ impl TerminalPane {
             last_click_cell: (0, 0),
             click_count: 0,
             hover_cell: None,
+            prediction: PredictionEngine::new(cols as u16, rows as u16),
         })
     }
 
@@ -400,6 +409,7 @@ impl TerminalPane {
             last_click_cell: (0, 0),
             click_count: 0,
             hover_cell: None,
+            prediction: PredictionEngine::new(cols as u16, rows as u16),
         })
     }
 
@@ -441,6 +451,7 @@ impl TerminalPane {
             last_click_cell: (0, 0),
             click_count: 0,
             hover_cell: None,
+            prediction: PredictionEngine::new(cols as u16, rows as u16),
         }
     }
 
@@ -452,6 +463,10 @@ impl TerminalPane {
     /// Drain all pending PTY output bytes from the channel and feed them to the
     /// terminal state machine.
     ///
+    /// Also feeds server output to the prediction engine so it can confirm or
+    /// discard speculative predictions. After processing all chunks, syncs the
+    /// confirmed cursor position from the alacritty Term grid.
+    ///
     /// Must be called from the main thread (render loop) before each frame.
     pub fn drain_output(&mut self) {
         let mut collected: Vec<Vec<u8>> = Vec::new();
@@ -462,9 +477,33 @@ impl TerminalPane {
             return;
         }
         let mut term = self.term.lock().unwrap();
+        for chunk in &collected {
+            // Feed bytes to the prediction engine for confirmation/mismatch detection
+            // before advancing the terminal state machine. This lets the engine compare
+            // its predicted bytes against the server's echo before the Term grid is updated.
+            self.prediction.process_server_output(chunk);
+        }
         for chunk in collected {
             self.processor.advance(&mut *term, &chunk);
         }
+
+        // After advancing the Term, check alternate-screen mode (vim, htop, etc.).
+        // When in alt-screen, reset all predictions and deactivate — we cannot safely
+        // predict terminal state inside modal applications. This is the primary safety
+        // gate for tmux-backed sessions where the inner pane may run vim at any time.
+        if term.mode().contains(TermMode::ALT_SCREEN) {
+            self.prediction.reset();
+            self.prediction.set_rtt(0); // deactivate until alt-screen exits
+        }
+
+        // After all server output is processed, snap the confirmed cursor position
+        // from the updated alacritty Term grid. This keeps the prediction engine's
+        // reference cursor in sync with the server's authoritative state.
+        let cursor = term.grid().cursor.point;
+        self.prediction.sync_confirmed_cursor(
+            cursor.column.0 as u16,
+            cursor.line.0 as u16,
+        );
     }
 
     /// Resize the terminal to fit the given pixel area.
@@ -498,12 +537,20 @@ impl TerminalPane {
         let new_size = TermSize::new(new_cols, new_rows);
         let mut term = self.term.lock().unwrap();
         term.resize(new_size);
+
+        // A resize invalidates all in-flight predictions — the server will redraw
+        // the full terminal. reset() is called internally by set_terminal_size().
+        self.prediction.set_terminal_size(new_cols as u16, new_rows as u16);
     }
 
     /// Write a key event to the PTY.
     ///
     /// Should be called when the terminal screen is active and a key is pressed.
     /// Returns `true` if the key was consumed (written to the PTY).
+    ///
+    /// Also feeds the keystroke to the prediction engine BEFORE sending to the
+    /// server, so the overlay is updated synchronously with the current render
+    /// frame. The bytes sent to the server are not modified.
     pub fn write_key(&mut self, key: &Key, ctrl_held: bool) -> bool {
         let app_cursor = {
             let term = self.term.lock().unwrap();
@@ -513,6 +560,30 @@ impl TerminalPane {
         if bytes.is_empty() {
             return false;
         }
+
+        // Feed keystroke to prediction engine before sending to server.
+        // This ensures the overlay is updated immediately (this render frame)
+        // rather than waiting for the server echo (next frame after RTT).
+        //
+        // Alternate screen detection: disable predictions in vim/htop/etc.
+        // When ALT_SCREEN is active, the terminal is in a modal application
+        // that we cannot safely predict — reset and deactivate.
+        let is_alt_screen = {
+            let term = self.term.lock().unwrap();
+            term.mode().contains(TermMode::ALT_SCREEN)
+        };
+        if is_alt_screen {
+            // Suppress predictions while in alternate screen mode.
+            // Do not reset here — just skip updating the engine so predictions
+            // remain cleared (reset is called when entering alt screen via drain_output).
+        } else {
+            let pred_key = PredKeyEvent {
+                bytes: bytes.clone(),
+                ctrl_held,
+            };
+            self.prediction.process_input(&pred_key);
+        }
+
         let _ = self.pty_writer.write_all(&bytes);
         let _ = self.pty_writer.flush();
         true
@@ -968,6 +1039,87 @@ impl TerminalPane {
                 .brush(&color)
                 .draw(Fill::NonZero, glyphs.into_iter());
         }
+
+        // --- Phase 2: Paint prediction overlay on top of confirmed terminal state ---
+        //
+        // The overlay is a sparse set of speculatively-rendered characters maintained
+        // by PredictionEngine. We paint them here, after the confirmed cell grid has
+        // been flushed, so predictions visually override any confirmed cell beneath them.
+        //
+        // visible_cells() filters by the confirmed epoch — only cells whose tentative
+        // epoch has been reached by confirmed server output are shown. No manual epoch
+        // checking is required here.
+        if self.prediction.is_active() {
+            let confirmed_epoch = self.prediction.confirmed_epoch();
+
+            // Collect predicted glyph data.
+            let mut predicted_glyphs: Vec<Glyph> = Vec::new();
+            let mut underline_rects: Vec<Rect> = Vec::new();
+
+            for ((col, row), overlay_cell) in self.prediction.overlay().visible_cells(confirmed_epoch) {
+                let col = col as usize;
+                let row = row as usize;
+                if col >= self.cols || row >= self.rows {
+                    continue;
+                }
+                let cell_x = offset_x + col as f64 * cw;
+                let cell_y = offset_y + row as f64 * ch;
+
+                // Predicted characters use the same foreground color as normal text.
+                // No background override — they sit on top of whatever confirmed state is below.
+                let font_ref = skrifa::FontRef::from_index(self.font.data.as_ref(), self.font.index);
+                if let Ok(font_ref) = font_ref {
+                    use skrifa::MetadataProvider;
+                    let charmap = font_ref.charmap();
+                    let gid = charmap.map(overlay_cell.ch).unwrap_or_default();
+                    let baseline_y = cell_y + ch * 0.8;
+                    predicted_glyphs.push(Glyph {
+                        id: gid.to_u32(),
+                        x: cell_x as f32,
+                        y: baseline_y as f32,
+                    });
+                }
+
+                // Underline the prediction when RTT > 80ms (flagging mode, matches Mosh behavior).
+                if overlay_cell.underlined {
+                    let underline_y = cell_y + ch - 2.0;
+                    underline_rects.push(Rect::new(
+                        cell_x, underline_y,
+                        cell_x + cw, underline_y + HYPERLINK_UNDERLINE_PX,
+                    ));
+                }
+            }
+
+            // Flush predicted glyphs in a single batch using the default foreground color.
+            if !predicted_glyphs.is_empty() {
+                scene
+                    .draw_glyphs(&self.font)
+                    .font_size(self.font_size)
+                    .brush(&TERM_FG)
+                    .draw(Fill::NonZero, predicted_glyphs.into_iter());
+            }
+
+            // Draw underlines for flagged predictions (RTT > 80ms).
+            for rect in underline_rects {
+                scene.fill(Fill::NonZero, Affine::IDENTITY, TERM_FG, None, &rect);
+            }
+
+            // Draw the predicted cursor on top of the overlay glyphs.
+            // The predicted cursor advances ahead of the confirmed cursor by one
+            // column per typed character, giving the appearance of instant response.
+            let (pred_col, pred_row) = self.prediction.predicted_cursor();
+            let pred_col = pred_col as usize;
+            let pred_row = pred_row as usize;
+            if pred_col < self.cols && pred_row < self.rows {
+                let cx = offset_x + pred_col as f64 * cw;
+                let cy = offset_y + pred_row as f64 * ch;
+                let cursor_rect = Rect::new(cx, cy, cx + cw, cy + ch);
+                // Use a slightly transparent cursor to distinguish predicted from confirmed.
+                const TERM_CURSOR_PREDICTED: Color = Color::new([0.40, 0.26, 0.13, 0.55]);
+                scene.fill(Fill::NonZero, Affine::IDENTITY, TERM_CURSOR_PREDICTED, None, &cursor_rect);
+            }
+        }
+        // --- End prediction overlay ---
 
         // Draw cursor.
         if self.cursor_visible {
