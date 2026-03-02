@@ -1087,6 +1087,29 @@ impl ApplicationHandler for App {
                     tree.drain_all_output();
                 }
 
+                // Propagate the latest WebSocket RTT to every PredictionEngine.
+                // We take the RTT from the first Connected instance; if none is
+                // connected the engines receive 0, suppressing predictions.
+                {
+                    let rtt_ms = self
+                        .app_mode_machine
+                        .inner()
+                        .instances
+                        .lock()
+                        .ok()
+                        .and_then(|instances| {
+                            instances
+                                .iter()
+                                .find(|i| i.status == crate::protocol::ConnectionStatus::Connected)
+                                .map(|i| i.rtt_ms)
+                        })
+                        .unwrap_or(0);
+
+                    if let Some(tree) = &mut self.pane_tree {
+                        tree.set_rtt_all(rtt_ms);
+                    }
+                }
+
                 // Read cursor blink interval from tokens, then drop the lock
                 // so we can call &mut self methods below.
                 let cursor_blink_ms = self.tokens.read().unwrap().animation.cursor_blink_ms;

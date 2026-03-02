@@ -365,6 +365,10 @@ pub struct LobsterInstance {
     pub state: DashboardState,
     pub last_update: Option<String>,
     pub protocol_version: Option<String>,
+    /// Smoothed round-trip time in milliseconds (EWMA, alpha=0.2).
+    /// Updated by the WebSocket ping/pong handler; read by the render loop
+    /// to propagate RTT into each `PredictionEngine`.
+    pub rtt_ms: u32,
 }
 
 impl LobsterInstance {
@@ -375,6 +379,7 @@ impl LobsterInstance {
             state: DashboardState::default(),
             last_update: None,
             protocol_version: None,
+            rtt_ms: 0,
         }
     }
 }
