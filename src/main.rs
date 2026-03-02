@@ -34,6 +34,8 @@
 mod dashboard;
 #[allow(dead_code)]
 mod design;
+#[allow(dead_code)]
+pub mod prediction;
 mod design_repl;
 mod info_screen;
 mod logging;
